@@ -1,12 +1,12 @@
 /*******************************************************************************
 *
-*  (C) COPYRIGHT AUTHORS, 2016 - 2025
+*  (C) COPYRIGHT AUTHORS, 2016 - 2026
 *
 *  TITLE:       BLACKLIST.C
 *
-*  VERSION:     2.01
+*  VERSION:     2.10
 *
-*  DATE:        02 Dec 2025
+*  DATE:        09 Sep 2026
 *
 *  Syscall blacklist handling.
 *
@@ -31,15 +31,72 @@ DWORD BlackListHashString(
     _In_ LPCSTR Name
 )
 {
-    DWORD Hash = 2166136261UL;
-    PCHAR p = (PCHAR)Name;
+    DWORD Hash;
+    const UCHAR* p;
+    UCHAR ch;
+
+    if (Name == NULL)
+        return 0;
+
+    Hash = 2166136261UL;
+    p = (const UCHAR*)Name;
 
     while (*p) {
-        Hash ^= *p++;
+        ch = *p++;
+        if (ch >= 'A' && ch <= 'Z')
+            ch = (UCHAR)(ch - 'A' + 'a');
+
+        Hash ^= ch;
         Hash *= 16777619;
     }
 
     return Hash;
+}
+
+/*
+* BlackListNormalizeEntry
+*
+* Purpose:
+*
+* Tolerate name=value, blank, and comment entries.
+*
+*/
+VOID BlackListNormalizeEntry(
+    _Inout_ LPSTR Entry
+)
+{
+    LPSTR s, eq;
+
+    if (Entry == NULL)
+        return;
+
+    s = Entry;
+    while (*s == ' ' || *s == '\t')
+        s++;
+
+    if (s != Entry) {
+        while (*s) {
+            *Entry++ = *s++;
+        }
+        *Entry = 0;
+        Entry = Entry - _strlen_a(Entry);
+    }
+
+    eq = _strchr_a(Entry, '=');
+    if (eq)
+        *eq = 0;
+
+    while (*Entry) {
+        Entry++;
+    }
+
+    while (Entry > s) {
+        Entry--;
+        if (*Entry == 0 || *Entry == ' ' || *Entry == '\t' || *Entry == '\r' || *Entry == '\n')
+            *Entry = 0;
+        else
+            break;
+    }
 }
 
 /*
@@ -97,15 +154,20 @@ BOOL BlackListCreateFromFile(
     _In_ LPCSTR ConfigSectionName
 )
 {
-    LPSTR Section = NULL, SectionPtr;
-    ULONG nSize, SectionSize, BytesRead, Length;
+    BOOL bSuccess;
+    ULONG i, nSize, SectionSize, BytesRead, EntryLength;
+    LPSTR Section, SectionPtr;
     CHAR ConfigFilePath[MAX_PATH + 16];
-    HANDLE BlackListHeap = NULL;
-    ULONG i;
+    HANDLE BlackListHeap;
+
+    Section = NULL;
+    BlackListHeap = NULL;
+    bSuccess = FALSE;
 
     do {
         RtlSecureZeroMemory(BlackList, sizeof(BLACKLIST));
         RtlSecureZeroMemory(ConfigFilePath, sizeof(ConfigFilePath));
+
         if (GetModuleFileNameA(NULL, (LPSTR)&ConfigFilePath, MAX_PATH) == 0)
             break;
 
@@ -118,7 +180,12 @@ BOOL BlackListCreateFromFile(
 
         HeapSetInformation(BlackListHeap, HeapEnableTerminationOnCorruption, NULL, 0);
 
-        nSize = 2 * (1024 * 1024);
+        BlackList->HeapHandle = BlackListHeap;
+        for (i = 0; i < BLACKLIST_HASH_TABLE_SIZE; i++) {
+            InitializeListHead(&BlackList->HashTable[i]);
+        }
+
+        nSize = 4 * (1024 * 1024);
         Section = (LPSTR)HeapAlloc(BlackListHeap, HEAP_ZERO_MEMORY, nSize);
         if (Section == NULL)
             break;
@@ -127,23 +194,29 @@ BOOL BlackListCreateFromFile(
         if (SectionSize == 0)
             break;
 
-        BlackList->HeapHandle = BlackListHeap;
-
-        for (i = 0; i < BLACKLIST_HASH_TABLE_SIZE; i++) {
-            InitializeListHead(&BlackList->HashTable[i]);
-        }
-
         BytesRead = 0;
         SectionPtr = Section;
 
         while (BytesRead < SectionSize && *SectionPtr) {
-            Length = BlackListAddEntry(BlackList, SectionPtr);
-            if (Length == 0) {
-                break;
+
+            EntryLength = (ULONG)_strlen_a(SectionPtr) + 1;
+            BlackListNormalizeEntry(SectionPtr);
+
+            if (*SectionPtr != 0 && *SectionPtr != ';' && *SectionPtr != '#') {
+                if (BlackListAddEntry(BlackList, SectionPtr) == 0) {
+                    BlackList->NumberOfEntries = 0;
+                    break;
+                }
             }
-            BytesRead += Length;
-            SectionPtr += Length;
+
+            BytesRead += EntryLength;
+            SectionPtr += EntryLength;
         }
+
+        if (BlackList->NumberOfEntries == 0)
+            break;
+
+        bSuccess = TRUE;
 
     } while (FALSE);
 
@@ -151,11 +224,11 @@ BOOL BlackListCreateFromFile(
         HeapFree(BlackListHeap, 0, Section);
     }
 
-    if (BlackList->NumberOfEntries == 0) {
+    if (!bSuccess) {
         if (BlackListHeap) {
             HeapDestroy(BlackListHeap);
-            BlackList->HeapHandle = NULL;
         }
+        RtlSecureZeroMemory(BlackList, sizeof(BLACKLIST));
         return FALSE;
     }
 
@@ -194,7 +267,7 @@ BOOL BlackListEntryPresent(
         Entry = CONTAINING_RECORD(Next, BL_ENTRY, ListEntry);
 
         if (Entry->Hash == Hash) {
-            if (_strcmp_a(Entry->Name, SyscallName) == 0)
+            if (_strcmpi_a(Entry->Name, SyscallName) == 0)
                 return TRUE;
         }
 

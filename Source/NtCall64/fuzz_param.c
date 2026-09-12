@@ -4,9 +4,9 @@
 *
 *  TITLE:       FUZZ_PARAM.C
 *
-*  VERSION:     2.01
+*  VERSION:     2.10
 *
-*  DATE:        14 Feb 2026
+*  DATE:        11 Sep 2026
 *
 *  Parameter type detection and structure generation for syscall fuzzing.
 *
@@ -21,26 +21,143 @@
 #include "fuzz_data.h"
 
 __declspec(thread) FUZZ_MEMORY_TRACKER g_MemoryTracker;
+__declspec(thread) BYTE g_FuzzStructBuffer[FUZZ_PARAM_BUFFER_SIZE];
+
+ULONG FuzzRandom(
+    VOID
+)
+{
+    ULONG x;
+
+    x = g_MemoryTracker.Seed;
+    if (x == 0) {
+        x = (ULONG)__rdtsc();
+        x ^= GetCurrentThreadId();
+        x ^= GetCurrentProcessId();
+        if (x == 0)
+            x = 0xA5A5A5A5;
+    }
+
+    x ^= (x << 13);
+    x ^= (x >> 17);
+    x ^= (x << 5);
+
+    g_MemoryTracker.Seed = x;
+    return x;
+}
 
 #ifdef _DEBUG
 BOOL VerifySyscallDatabaseSorted(UINT DbType)
 {
-    SYSCALL_PARAM_INFO* Database = (DbType == 0) ? (SYSCALL_PARAM_INFO*)KnownNtSyscalls : (SYSCALL_PARAM_INFO*)KnownWin32kSyscalls;
-    SYSCALL_PARAM_INFO* prev = Database;
-    SYSCALL_PARAM_INFO* curr = Database + 1;
+    ULONG i;
+    SYSCALL_PARAM_INFO* Database;
 
-    while (curr->Name != NULL) {
-        if (_strcmpi_a(prev->Name, curr->Name) > 0) {
-            OutputDebugStringA(prev->Name);
-            OutputDebugStringA("\n\r");
+    Database = (DbType == 0) ? (SYSCALL_PARAM_INFO*)KnownNtSyscalls : (SYSCALL_PARAM_INFO*)KnownWin32kSyscalls;
+
+    for (i = 1; Database[i].Name != NULL; i++) {
+        if (_strcmpi_a(Database[i - 1].Name, Database[i].Name) > 0) {
+            OutputDebugStringA(Database[i - 1].Name);
+            OutputDebugStringA("\n");
             return FALSE;
         }
-        prev = curr;
-        curr++;
     }
+
+    return TRUE;
+}
+
+BOOL VerifySyscallDatabaseIntegrity(UINT DbType)
+{
+    ULONG i;
+    SYSCALL_PARAM_INFO* Database;
+
+    Database = (DbType == 0) ? (SYSCALL_PARAM_INFO*)KnownNtSyscalls : (SYSCALL_PARAM_INFO*)KnownWin32kSyscalls;
+
+    for (i = 0; Database[i].Name != NULL; i++) {
+
+        if (Database[i].Name[0] == 0) {
+            OutputDebugStringA("Empty syscall name found in database\n");
+            return FALSE;
+        }
+
+        if (i > 0) {
+            if (_strcmpi_a(Database[i - 1].Name, Database[i].Name) == 0) {
+                OutputDebugStringA("Duplicate syscall entry found in database\n");
+                OutputDebugStringA(Database[i].Name);
+                OutputDebugStringA("\n");
+                return FALSE;
+            }
+        }
+    }
+
     return TRUE;
 }
 #endif
+
+LPCSTR FuzzSkipSyscallPrefix(
+    _In_ LPCSTR SyscallName
+)
+{
+    if (SyscallName == NULL)
+        return NULL;
+
+    if (_strncmp_a(SyscallName, "NtUser", 6) == 0)
+        return SyscallName + 6;
+
+    if (_strncmp_a(SyscallName, "NtGdi", 5) == 0)
+        return SyscallName + 5;
+
+    if (_strncmp_a(SyscallName, "Nt", 2) == 0)
+        return SyscallName + 2;
+
+    if (_strncmp_a(SyscallName, "Zw", 2) == 0)
+        return SyscallName + 2;
+
+    return SyscallName;
+}
+
+BOOL FuzzHasVerbPrefix(
+    _In_ LPCSTR SyscallName,
+    _In_ LPCSTR Verb
+)
+{
+    LPCSTR namePart;
+
+    namePart = FuzzSkipSyscallPrefix(SyscallName);
+    if (namePart == NULL || Verb == NULL)
+        return FALSE;
+
+    return (_strncmp_a(namePart, Verb, _strlen_a(Verb)) == 0);
+}
+
+BOOL FuzzHasTerm(
+    _In_ LPCSTR SyscallName,
+    _In_ LPCSTR Term
+)
+{
+    if (SyscallName == NULL || Term == NULL)
+        return FALSE;
+
+    return (_strstr_a(SyscallName, Term) != NULL);
+}
+
+PBYTE FuzzGetParameterStructSlot(
+    _In_ PBYTE BufferBase,
+    _In_ ULONG ParameterIndex
+)
+{
+    if (BufferBase == NULL || ParameterIndex >= MAX_PARAMETERS)
+        return NULL;
+
+    return BufferBase + (ParameterIndex * FUZZ_PARAM_SLOT_SIZE);
+}
+
+SIZE_T FuzzGetRemainingSlotSize(
+    _In_ ULONG ParameterIndex
+)
+{
+    UNREFERENCED_PARAMETER(ParameterIndex);
+    return FUZZ_PARAM_SLOT_SIZE;
+}
 
 /*
 * FuzzTrackAllocation
@@ -50,13 +167,13 @@ BOOL VerifySyscallDatabaseSorted(UINT DbType)
 * Track allocated memory so it can be freed even if the stack is corrupted.
 *
 */
-VOID FuzzTrackAllocation(
+BOOLEAN FuzzTrackAllocation(
     _In_ PVOID Address,
     _In_ FUZZ_ALLOC_TYPE Type
 )
 {
     if (Address == NULL)
-        return;
+        return FALSE;
 
     while (InterlockedCompareExchange(&g_MemoryTracker.Lock, 1, 0) != 0) {
         YieldProcessor();
@@ -66,9 +183,13 @@ VOID FuzzTrackAllocation(
         g_MemoryTracker.Addresses[g_MemoryTracker.Count] = Address;
         g_MemoryTracker.Types[g_MemoryTracker.Count] = Type;
         g_MemoryTracker.Count++;
+        InterlockedExchange(&g_MemoryTracker.Lock, 0);
+        return TRUE;
     }
 
+    g_MemoryTracker.Overflow = TRUE;
     InterlockedExchange(&g_MemoryTracker.Lock, 0);
+    return FALSE;
 }
 /*
 * FuzzCleanupAllocations
@@ -76,7 +197,6 @@ VOID FuzzTrackAllocation(
 * Purpose:
 *
 * Free all tracked memory allocations.
-* This is called from a separate context to handle stack corruption.
 *
 */
 VOID FuzzCleanupAllocations()
@@ -107,7 +227,7 @@ VOID FuzzCleanupAllocations()
     }
     g_MemoryTracker.Count = 0;
     g_MemoryTracker.InUse = FALSE;
-
+    g_MemoryTracker.Overflow = FALSE;
     InterlockedExchange(&g_MemoryTracker.Lock, 0);
 }
 
@@ -119,22 +239,33 @@ VOID FuzzCleanupAllocations()
 * Performs binary search on a sorted syscall database to find parameter type information.
 *
 */
-PARAM_TYPE_HINT FuzzSyscallBinarySearch(
+SYSCALL_LOOKUP_RESULT FuzzSyscallBinarySearch(
     _In_ LPCSTR SyscallName,
     _In_ ULONG ParamIndex,
     _In_ const SYSCALL_PARAM_INFO* Database,
-    _In_ ULONG DatabaseCount
+    _In_ ULONG DatabaseCount,
+    _Out_ PARAM_TYPE_HINT* TypeHint
 )
 {
-    int left = 0;
-    int right = (int)DatabaseCount - 1;
-    int mid, result;
+    INT left, right, mid, result;
+
+    if (TypeHint == NULL)
+        return SyscallLookupNotFound;
+
+    *TypeHint = ParamTypeGeneral;
+
+    left = 0;
+    right = (INT)DatabaseCount - 1;
 
     while (left <= right) {
         mid = left + ((right - left) / 2);
         result = _strcmpi_a(SyscallName, Database[mid].Name);
+
         if (result == 0) {
-            return Database[mid].ParamTypes[ParamIndex];
+            if (ParamIndex < RTL_NUMBER_OF(Database[mid].ParamTypes)) {
+                *TypeHint = Database[mid].ParamTypes[ParamIndex];
+            }
+            return SyscallLookupFound;
         }
 
         if (result < 0) {
@@ -145,7 +276,7 @@ PARAM_TYPE_HINT FuzzSyscallBinarySearch(
         }
     }
 
-    return ParamTypeGeneral;
+    return SyscallLookupNotFound;
 }
 
 /*
@@ -165,6 +296,7 @@ PARAM_TYPE_HINT FuzzGetSyscallParamType(
     const SYSCALL_PARAM_INFO* pDatabase;
     ULONG databaseCount;
     PARAM_TYPE_HINT result;
+    SYSCALL_LOOKUP_RESULT lookupResult;
 
     if (!SyscallName || ParamIndex >= 16)
         return ParamTypeGeneral;
@@ -178,13 +310,12 @@ PARAM_TYPE_HINT FuzzGetSyscallParamType(
         databaseCount = KNOWN_NT_SYSCALLS_COUNT;
     }
 
-    result = FuzzSyscallBinarySearch(SyscallName, ParamIndex, pDatabase, databaseCount);
-
-    if (result == ParamTypeGeneral) {
-        return FuzzDetermineParameterTypeHeuristic(SyscallName, ParamIndex, IsWin32kSyscall);
+    lookupResult = FuzzSyscallBinarySearch(SyscallName, ParamIndex, pDatabase, databaseCount, &result);
+    if (lookupResult == SyscallLookupFound) {
+        return result;
     }
 
-    return result;
+    return FuzzDetermineParameterTypeHeuristic(SyscallName, ParamIndex, IsWin32kSyscall);
 }
 
 /*
@@ -202,290 +333,745 @@ PARAM_TYPE_HINT FuzzDetermineParameterTypeHeuristic(
     _In_ BOOL IsWin32kSyscall
 )
 {
-    BOOL hasCreatePrefix = _strstr_a(SyscallName, "Create") != NULL;
-    BOOL hasOpenPrefix = _strstr_a(SyscallName, "Open") != NULL;
-    BOOL hasQueryPrefix = _strstr_a(SyscallName, "Query") != NULL;
-    BOOL hasSetPrefix = _strstr_a(SyscallName, "Set") != NULL;
-    BOOL hasEnumeratePrefix = _strstr_a(SyscallName, "Enumerate") != NULL;
-    BOOL hasAllocPrefix = _strstr_a(SyscallName, "Allocate") != NULL;
-    BOOL hasFreePrefix = _strstr_a(SyscallName, "Free") != NULL;
-    BOOL hasGetPrefix = _strstr_a(SyscallName, "Get") != NULL;
+    if (SyscallName == NULL)
+        return ParamTypeGeneral;
 
-    BOOL hasFileTerm = _strstr_a(SyscallName, "File") != NULL;
-    BOOL hasKeyTerm = _strstr_a(SyscallName, "Key") != NULL;
-    BOOL hasRegistryTerm = hasKeyTerm || _strstr_a(SyscallName, "Registry") != NULL;
-    BOOL hasMemoryTerm = _strstr_a(SyscallName, "Memory") != NULL || _strstr_a(SyscallName, "Virtual") != NULL;
-    BOOL hasProcessTerm = _strstr_a(SyscallName, "Process") != NULL;
-    BOOL hasThreadTerm = _strstr_a(SyscallName, "Thread") != NULL;
-    BOOL hasTokenTerm = _strstr_a(SyscallName, "Token") != NULL;
-    BOOL hasInfoTerm = _strstr_a(SyscallName, "Information") != NULL;
-    BOOL hasReadTerm = _strstr_a(SyscallName, "Read") != NULL;
-    BOOL hasWriteTerm = _strstr_a(SyscallName, "Write") != NULL;
-    BOOL hasSecurityTerm = _strstr_a(SyscallName, "Security") != NULL ||
-        _strstr_a(SyscallName, "Sacl") != NULL ||
-        _strstr_a(SyscallName, "Dacl") != NULL;
-    BOOL hasTimeTerm = _strstr_a(SyscallName, "Time") != NULL ||
-        _strstr_a(SyscallName, "Timer") != NULL ||
-        _strstr_a(SyscallName, "Delay") != NULL ||
-        _strstr_a(SyscallName, "Wait") != NULL;
-    BOOL hasSectionTerm = _strstr_a(SyscallName, "Section") != NULL;
-    BOOL hasValueTerm = _strstr_a(SyscallName, "Value") != NULL;
-    BOOL hasClientTerm = _strstr_a(SyscallName, "Client") != NULL || _strstr_a(SyscallName, "PID") != NULL;
-    BOOL hasPrivilegeTerm = _strstr_a(SyscallName, "Privilege") != NULL;
+    BOOL hasCreatePrefix = FuzzHasVerbPrefix(SyscallName, "Create");
+    BOOL hasOpenPrefix = FuzzHasVerbPrefix(SyscallName, "Open");
+    BOOL hasQueryPrefix = FuzzHasVerbPrefix(SyscallName, "Query");
+    BOOL hasSetPrefix = FuzzHasVerbPrefix(SyscallName, "Set");
+    BOOL hasEnumeratePrefix = FuzzHasVerbPrefix(SyscallName, "Enumerate");
+    BOOL hasAllocPrefix = FuzzHasVerbPrefix(SyscallName, "Allocate");
+    BOOL hasFreePrefix = FuzzHasVerbPrefix(SyscallName, "Free");
+    BOOL hasGetPrefix = FuzzHasVerbPrefix(SyscallName, "Get");
+    BOOL hasReadPrefix = FuzzHasVerbPrefix(SyscallName, "Read");
+    BOOL hasWritePrefix = FuzzHasVerbPrefix(SyscallName, "Write");
+    BOOL hasMapPrefix = FuzzHasVerbPrefix(SyscallName, "Map");
+    BOOL hasUnmapPrefix = FuzzHasVerbPrefix(SyscallName, "Unmap");
+    BOOL hasProtectPrefix = FuzzHasVerbPrefix(SyscallName, "Protect");
+    BOOL hasLockPrefix = FuzzHasVerbPrefix(SyscallName, "Lock");
+    BOOL hasUnlockPrefix = FuzzHasVerbPrefix(SyscallName, "Unlock");
 
-    BOOL isUserFunction = IsWin32kSyscall && _strstr_a(SyscallName, "NtUser") != NULL;
-    BOOL isGdiFunction = IsWin32kSyscall && _strstr_a(SyscallName, "NtGdi") != NULL;
-    BOOL hasWindowTerm = _strstr_a(SyscallName, "Window") != NULL;
-    BOOL hasMenuTerm = _strstr_a(SyscallName, "Menu") != NULL;
-    BOOL hasDCTerm = _strstr_a(SyscallName, "DC") != NULL;
-    BOOL hasDrawTerm = _strstr_a(SyscallName, "Draw") != NULL ||
-        _strstr_a(SyscallName, "Paint") != NULL ||
-        _strstr_a(SyscallName, "Fill") != NULL;
+    BOOL hasFileTerm = FuzzHasTerm(SyscallName, "File");
+    BOOL hasKeyTerm = FuzzHasTerm(SyscallName, "Key");
+    BOOL hasRegistryTerm = hasKeyTerm || FuzzHasTerm(SyscallName, "Registry");
+    BOOL hasMemoryTerm = FuzzHasTerm(SyscallName, "Memory") || FuzzHasTerm(SyscallName, "Virtual");
+    BOOL hasVirtualTerm = FuzzHasTerm(SyscallName, "Virtual");
+    BOOL hasProcessTerm = FuzzHasTerm(SyscallName, "Process");
+    BOOL hasThreadTerm = FuzzHasTerm(SyscallName, "Thread");
+    BOOL hasTokenTerm = FuzzHasTerm(SyscallName, "Token");
+    BOOL hasInfoTerm = FuzzHasTerm(SyscallName, "Information");
+    BOOL hasReadTerm = FuzzHasTerm(SyscallName, "Read");
+    BOOL hasWriteTerm = FuzzHasTerm(SyscallName, "Write");
+    BOOL hasSecurityTerm = FuzzHasTerm(SyscallName, "Security") ||
+        FuzzHasTerm(SyscallName, "Sacl") ||
+        FuzzHasTerm(SyscallName, "Dacl");
+    BOOL hasTimeTerm = FuzzHasTerm(SyscallName, "Time") ||
+        FuzzHasTerm(SyscallName, "Timer") ||
+        FuzzHasTerm(SyscallName, "Delay") ||
+        FuzzHasTerm(SyscallName, "Wait");
+    BOOL hasSectionTerm = FuzzHasTerm(SyscallName, "Section");
+    BOOL hasValueTerm = FuzzHasTerm(SyscallName, "Value");
+    BOOL hasClientTerm = FuzzHasTerm(SyscallName, "Client") || FuzzHasTerm(SyscallName, "PID");
+    BOOL hasPrivilegeTerm = FuzzHasTerm(SyscallName, "Privilege");
+    BOOL hasObjectTerm = FuzzHasTerm(SyscallName, "Object");
+    BOOL hasSystemTerm = FuzzHasTerm(SyscallName, "System");
+    BOOL hasPortTerm = FuzzHasTerm(SyscallName, "Port");
+    BOOL hasTimerTerm = FuzzHasTerm(SyscallName, "Timer");
+    BOOL hasMutantTerm = FuzzHasTerm(SyscallName, "Mutant");
+    BOOL hasEventTerm = FuzzHasTerm(SyscallName, "Event");
+    BOOL hasSemaphoreTerm = FuzzHasTerm(SyscallName, "Semaphore");
+
+    BOOL isUserFunction = IsWin32kSyscall && (_strncmp_a(SyscallName, "NtUser", 6) == 0);
+    BOOL isGdiFunction = IsWin32kSyscall && (_strncmp_a(SyscallName, "NtGdi", 5) == 0);
+    BOOL hasWindowTerm = FuzzHasTerm(SyscallName, "Window");
+    BOOL hasMenuTerm = FuzzHasTerm(SyscallName, "Menu");
+    BOOL hasDCTerm = FuzzHasTerm(SyscallName, "DC");
+    BOOL hasDrawTerm = FuzzHasTerm(SyscallName, "Draw") ||
+        FuzzHasTerm(SyscallName, "Paint") ||
+        FuzzHasTerm(SyscallName, "Fill") ||
+        FuzzHasTerm(SyscallName, "Blt");
+    BOOL hasNameTerm = FuzzHasTerm(SyscallName, "Name");
+    BOOL hasTextTerm = FuzzHasTerm(SyscallName, "Text");
+    BOOL hasColorTerm = FuzzHasTerm(SyscallName, "Color");
+    BOOL hasSelectTerm = FuzzHasTerm(SyscallName, "Select");
+    BOOL hasCursorTerm = FuzzHasTerm(SyscallName, "Cursor");
+    BOOL hasRectTerm = FuzzHasTerm(SyscallName, "Rect") || FuzzHasTerm(SyscallName, "Rgn");
+    BOOL hasPointTerm = FuzzHasTerm(SyscallName, "Point") || FuzzHasTerm(SyscallName, "Pos");
+    BOOL hasInputTerm = FuzzHasTerm(SyscallName, "Input");
 
     BOOL isFirstParam = (ParameterIndex == 0);
     BOOL isSecondParam = (ParameterIndex == 1);
     BOOL isThirdParam = (ParameterIndex == 2);
     BOOL isFourthParam = (ParameterIndex == 3);
     BOOL isFifthParam = (ParameterIndex == 4);
+    BOOL isSixthParam = (ParameterIndex == 5);
+    BOOL isSeventhParam = (ParameterIndex == 6);
+    BOOL isEighthParam = (ParameterIndex == 7);
     BOOL isHighIndexParam = (ParameterIndex >= 5);
 
-    // ========== SYSTEM-WIDE PATTERNS ==========
+    // ============================================================
+    // SYSTEM-WIDE PATTERNS
+    // ============================================================
 
-    // Security descriptor parameters
     if (hasSecurityTerm) {
         if (isThirdParam || isFourthParam) {
             return ParamTypeSecDesc;
         }
     }
 
-    // Time and interval parameters
     if (hasTimeTerm) {
         if (isSecondParam || isThirdParam) {
-            return ParamTypeTimeout; // Likely a LARGE_INTEGER time value
+            return ParamTypeTimeout;
         }
     }
 
-    // Section-related parameters
-    if (hasSectionTerm) {
-        if (isFirstParam) return ParamTypeHandle;
-        if (isThirdParam || isFourthParam) return ParamTypeAddress;
-        if (isSecondParam && hasQueryPrefix) return ParamTypeInfoClass;
-    }
-
-    // Client ID parameters for thread/process identification
     if ((hasProcessTerm || hasThreadTerm) && hasClientTerm) {
         if (isThirdParam || isFourthParam) {
             return ParamTypeClientId;
         }
     }
 
-    // Privilege-related parameters
-    if (hasPrivilegeTerm && (hasTokenTerm || hasSetPrefix)) {
-        if (isSecondParam || isThirdParam) {
+    if (hasPrivilegeTerm && hasTokenTerm) {
+        if (isFirstParam)
+            return ParamTypeToken;
+
+        if (isThirdParam)
             return ParamTypePrivilege;
-        }
     }
 
-    // ========== WIN32K SYSCALLS ==========
+    // ============================================================
+    // WIN32K HEURISTICS
+    // ============================================================
 
     if (IsWin32kSyscall) {
-        // User function parameter patterns
+
         if (isUserFunction) {
+
+            if (hasGetPrefix || hasQueryPrefix) {
+                if (isFirstParam) {
+                    if (hasWindowTerm || hasMenuTerm)
+                        return ParamTypeWinHandle;
+                    return ParamTypeHandle;
+                }
+
+                if (isSecondParam) {
+                    if (hasRectTerm || hasPointTerm || hasCursorTerm || hasInputTerm)
+                        return ParamTypeAddress;
+                    if (hasInfoTerm)
+                        return ParamTypeInfoClass;
+                    return ParamTypeOutPtr;
+                }
+
+                if (isThirdParam) {
+                    if (hasRectTerm || hasPointTerm)
+                        return ParamTypeAddress;
+                    return ParamTypeFlag;
+                }
+
+                if (isFourthParam)
+                    return ParamTypeOutPtr;
+            }
+
+            if (hasCreatePrefix || hasOpenPrefix) {
+                if (isFirstParam) {
+                    if (hasWindowTerm || hasMenuTerm)
+                        return ParamTypeWinHandle;
+                    return ParamTypeAddress;
+                }
+
+                if (isSecondParam) {
+                    if (hasNameTerm || hasTextTerm)
+                        return ParamTypeUnicodeStr;
+                    return ParamTypeFlag;
+                }
+
+                if (isThirdParam) {
+                    if (hasNameTerm || hasTextTerm)
+                        return ParamTypeUnicodeStr;
+                    return ParamTypeFlag;
+                }
+            }
+
             if (isFirstParam) {
-                if (hasWindowTerm || hasMenuTerm) {
+                if (hasWindowTerm || hasMenuTerm || hasCursorTerm)
                     return ParamTypeWinHandle;
-                }
-                if (hasCreatePrefix || hasOpenPrefix) {
-                    return ParamTypeAddress; // Output handle pointer
-                }
-
-                return ParamTypeWinHandle; // Default for first param in NtUser
+                if (hasRectTerm || hasPointTerm || hasInputTerm)
+                    return ParamTypeAddress;
+                return ParamTypeWinHandle;
             }
 
-            // String related parameters
-            if ((isSecondParam || isThirdParam) &&
-                (hasCreatePrefix || _strstr_a(SyscallName, "Name") != NULL ||
-                    _strstr_a(SyscallName, "Text") != NULL))
-            {
-                return ParamTypeUnicodeStr;
-            }
-
-            // Common patterns for second parameters
             if (isSecondParam) {
-                if (hasCreatePrefix || hasOpenPrefix) {
-                    return ParamTypeAccess; // For Create/Open, second param often access rights
-                }
-                if (hasSetPrefix || hasQueryPrefix) {
-                    return ParamTypeInfoClass; // For Set/Query, often info class
-                }
-                if (hasGetPrefix) {
-                    return ParamTypeOutPtr; // For Get, often output buffer
-                }
-                return ParamTypeFlag; // Default fallback
+                if (hasRectTerm || hasPointTerm || hasInputTerm)
+                    return ParamTypeAddress;
+                if (hasNameTerm || hasTextTerm)
+                    return ParamTypeUnicodeStr;
+                return ParamTypeFlag;
             }
 
-            // Output pointers in User calls
-            if ((isThirdParam || isFourthParam) &&
-                (hasGetPrefix || hasQueryPrefix)) {
+            if (isThirdParam) {
+                if (hasRectTerm || hasPointTerm)
+                    return ParamTypeAddress;
+                if (hasGetPrefix || hasQueryPrefix)
+                    return ParamTypeOutPtr;
+                return ParamTypeFlag;
+            }
+
+            if (isFourthParam && (hasGetPrefix || hasQueryPrefix)) {
                 return ParamTypeOutPtr;
             }
         }
 
-        // GDI function parameter patterns
         if (isGdiFunction) {
+
             if (isFirstParam) {
-                if (hasDCTerm ||
-                    _strstr_a(SyscallName, "Select") != NULL ||
-                    hasDrawTerm)
-                {
+                if (hasDCTerm || hasDrawTerm || hasSelectTerm)
                     return ParamTypeGdiHandle;
-                }
-
-                if (hasCreatePrefix) {
-                    return ParamTypeFlag; // Often width/height for creation
-                }
-
-                return ParamTypeGdiHandle; // Default for first param in NtGdi
-            }
-
-            // Common patterns for GDI parameters
-            if (hasDrawTerm && (isSecondParam || isThirdParam || isFourthParam)) {
-                return ParamTypeFlag; // Often coordinates or dimensions
-            }
-
-            if (isSecondParam &&
-                (_strstr_a(SyscallName, "Select") != NULL ||
-                    _strstr_a(SyscallName, "Get") != NULL))
-            {
+                if (hasRectTerm || hasPointTerm)
+                    return ParamTypeAddress;
+                if (hasCreatePrefix)
+                    return ParamTypeFlag;
                 return ParamTypeGdiHandle;
             }
 
-            if (isSecondParam || isThirdParam) {
-                if (_strstr_a(SyscallName, "Color") != NULL) {
-                    return ParamTypeFlag; // COLORREF value
-                }
-                if (_strstr_a(SyscallName, "Create") != NULL ||
-                    _strstr_a(SyscallName, "Set") != NULL)
-                {
-                    return ParamTypeFlag; // Properties for creation/setting
-                }
+            if (isSecondParam) {
+                if (hasRectTerm || hasPointTerm)
+                    return ParamTypeAddress;
+                if (hasSelectTerm || hasGetPrefix)
+                    return ParamTypeGdiHandle;
+                if (hasColorTerm)
+                    return ParamTypeFlag;
+                return ParamTypeFlag;
+            }
+
+            if (isThirdParam) {
+                if (hasRectTerm || hasPointTerm)
+                    return ParamTypeAddress;
+                if (hasDrawTerm)
+                    return ParamTypeFlag;
+                return ParamTypeFlag;
+            }
+
+            if (isFourthParam) {
+                if (hasRectTerm || hasPointTerm)
+                    return ParamTypeAddress;
+                return ParamTypeFlag;
             }
         }
 
-        // General patterns for Win32k parameters
         if (isHighIndexParam) {
-            // Common pattern: alternating address and flag/value
             return (ParameterIndex % 2 == 0) ? ParamTypeAddress : ParamTypeFlag;
         }
     }
-    // ========== NT SYSCALLS ==========
     else {
-        // ======= COMMON NT SYSCALL PATTERNS ========
+        // ========================================================
+        // NT FAMILY / DOMAIN HEURISTICS
+        // ========================================================
 
-        // Create/Open pattern - most common NT API pattern
-        if (hasCreatePrefix || hasOpenPrefix) {
-            if (isFirstParam) return ParamTypeAddress;  // Output handle pointer
-            if (isSecondParam) return ParamTypeAccess;  // Access mask
-            if (isThirdParam) return ParamTypeObjectAttr; // Object attributes
+        // Virtual memory and related families
+        if (hasVirtualTerm || hasMemoryTerm || hasAllocPrefix || hasFreePrefix ||
+            hasMapPrefix || hasUnmapPrefix || hasProtectPrefix || hasLockPrefix || hasUnlockPrefix)
+        {
+            if (hasAllocPrefix || hasFreePrefix) {
+                if (isFirstParam)
+                    return ParamTypeHandle;
+                if (isSecondParam || isThirdParam)
+                    return ParamTypeAddress;
+                if (isFourthParam)
+                    return ParamTypeFlag;
+                if (isFifthParam)
+                    return ParamTypeFlag;
+            }
+
+            if (hasQueryPrefix && (hasVirtualTerm || hasMemoryTerm)) {
+                if (isFirstParam)
+                    return ParamTypeHandle;
+                if (isSecondParam)
+                    return ParamTypeAddress;
+                if (isThirdParam)
+                    return ParamTypeInfoClass;
+                if (isFourthParam)
+                    return ParamTypeAddress;
+                if (isFifthParam)
+                    return ParamTypeBufferSize;
+                if (isSixthParam)
+                    return ParamTypeRetLength;
+            }
+
+            if (hasReadPrefix || hasWritePrefix) {
+                if (isFirstParam)
+                    return ParamTypeHandle;
+                if (isSecondParam)
+                    return ParamTypeAddress;
+                if (isThirdParam)
+                    return ParamTypeAddress;
+                if (isFourthParam)
+                    return ParamTypeBufferSize;
+                if (isFifthParam)
+                    return ParamTypeRetLength;
+            }
+
+            if (hasMapPrefix || hasUnmapPrefix || hasProtectPrefix || hasLockPrefix || hasUnlockPrefix) {
+                if (isFirstParam)
+                    return ParamTypeHandle;
+                if (isSecondParam || isThirdParam)
+                    return ParamTypeAddress;
+                if (isFourthParam)
+                    return ParamTypeFlag;
+            }
         }
 
-        // Query pattern - second most common NT API pattern
+        // Query/Set System Information family
+        if (hasSystemTerm && hasInfoTerm) {
+            if (hasQueryPrefix || hasSetPrefix) {
+                if (isFirstParam)
+                    return ParamTypeInfoClass;
+                if (isSecondParam)
+                    return ParamTypeAddress;
+                if (isThirdParam)
+                    return ParamTypeBufferSize;
+                if (isFourthParam && hasQueryPrefix)
+                    return ParamTypeRetLength;
+            }
+        }
+
+        // Query/Set Information family for common object domains
+        if (hasInfoTerm && (hasQueryPrefix || hasSetPrefix)) {
+            if (hasProcessTerm || hasThreadTerm || hasTokenTerm || hasObjectTerm ||
+                hasSectionTerm || hasFileTerm || hasKeyTerm || hasPortTerm ||
+                hasEventTerm || hasMutantTerm || hasSemaphoreTerm || hasTimerTerm)
+            {
+                if (isFirstParam) {
+                    if (hasTokenTerm)
+                        return ParamTypeToken;
+                    return ParamTypeHandle;
+                }
+
+                if (isSecondParam)
+                    return ParamTypeInfoClass;
+
+                if (isThirdParam)
+                    return ParamTypeAddress;
+
+                if (isFourthParam)
+                    return ParamTypeBufferSize;
+
+                if (isFifthParam && hasQueryPrefix)
+                    return ParamTypeRetLength;
+            }
+        }
+
+        // Open process/thread style families
+        if (hasOpenPrefix && (hasProcessTerm || hasThreadTerm)) {
+            if (isFirstParam)
+                return ParamTypeAddress;
+            if (isSecondParam)
+                return ParamTypeAccess;
+            if (isThirdParam)
+                return ParamTypeObjectAttr;
+            if (isFourthParam)
+                return ParamTypeClientId;
+        }
+
+        // Open token from process/thread style families
+        if (hasOpenPrefix && hasTokenTerm && (hasProcessTerm || hasThreadTerm)) {
+            if (isFirstParam)
+                return ParamTypeHandle;
+            if (isSecondParam)
+                return ParamTypeAccess;
+            if (isThirdParam)
+                return ParamTypeAddress;
+            if (isFourthParam)
+                return ParamTypeFlag;
+            if (isFifthParam)
+                return ParamTypeAddress;
+        }
+
+        // Section families
+        if (hasSectionTerm) {
+            if (hasQueryPrefix || hasSetPrefix) {
+                if (isFirstParam)
+                    return ParamTypeHandle;
+                if (isSecondParam)
+                    return ParamTypeInfoClass;
+                if (isThirdParam)
+                    return ParamTypeAddress;
+                if (isFourthParam)
+                    return ParamTypeBufferSize;
+                if (isFifthParam && hasQueryPrefix)
+                    return ParamTypeRetLength;
+            }
+
+            if (hasCreatePrefix || hasOpenPrefix) {
+                if (isFirstParam)
+                    return ParamTypeAddress;
+                if (isSecondParam)
+                    return ParamTypeAccess;
+                if (isThirdParam)
+                    return ParamTypeObjectAttr;
+            }
+        }
+
+        // File I/O families
+        if (hasFileTerm || hasReadTerm || hasWriteTerm) {
+            if (hasReadPrefix || hasWritePrefix ||
+                FuzzHasTerm(SyscallName, "FsControl") ||
+                FuzzHasTerm(SyscallName, "DeviceIoControl"))
+            {
+                if (isFirstParam)
+                    return ParamTypeHandle;
+                if (isSecondParam)
+                    return ParamTypeHandle;
+                if (isThirdParam)
+                    return ParamTypeAddress;
+                if (isFourthParam)
+                    return ParamTypeAddress;
+                if (isFifthParam)
+                    return ParamTypeStatus;
+                if (isSixthParam)
+                    return ParamTypeAddress;
+                if (isSeventhParam)
+                    return ParamTypeBufferSize;
+                if (isEighthParam)
+                    return ParamTypeAddress;
+            }
+
+            if (hasCreatePrefix || hasOpenPrefix) {
+                if (isFirstParam)
+                    return ParamTypeAddress;
+                if (isSecondParam)
+                    return ParamTypeAccess;
+                if (isThirdParam)
+                    return ParamTypeObjectAttr;
+                if (isFourthParam)
+                    return ParamTypeStatus;
+            }
+
+            if (hasQueryPrefix || hasSetPrefix) {
+                if (isFirstParam)
+                    return ParamTypeHandle;
+                if (isSecondParam && !hasInfoTerm)
+                    return ParamTypeStatus;
+                if (isThirdParam)
+                    return ParamTypeAddress;
+                if (isFourthParam)
+                    return ParamTypeBufferSize;
+                if (isFifthParam && hasInfoTerm)
+                    return ParamTypeInfoClass;
+            }
+        }
+
+        // Registry / key / value families
+        if (hasRegistryTerm || hasKeyTerm || hasValueTerm) {
+            if (hasCreatePrefix || hasOpenPrefix) {
+                if (isFirstParam)
+                    return ParamTypeAddress;
+                if (isSecondParam)
+                    return ParamTypeAccess;
+                if (isThirdParam)
+                    return ParamTypeObjectAttr;
+                if (isFourthParam && hasKeyTerm)
+                    return ParamTypeFlag;
+                if (isFifthParam && hasValueTerm)
+                    return ParamTypeUnicodeStr;
+            }
+
+            if (hasQueryPrefix) {
+                if (isFirstParam)
+                    return ParamTypeHandle;
+                if (isSecondParam) {
+                    if (hasValueTerm)
+                        return ParamTypeUnicodeStr;
+                    return ParamTypeInfoClass;
+                }
+                if (isThirdParam) {
+                    if (hasValueTerm)
+                        return ParamTypeFlag;
+                    return ParamTypeAddress;
+                }
+                if (isFourthParam)
+                    return ParamTypeAddress;
+                if (isFifthParam)
+                    return ParamTypeBufferSize;
+                if (isSixthParam)
+                    return ParamTypeRetLength;
+            }
+
+            if (hasSetPrefix) {
+                if (isFirstParam)
+                    return ParamTypeHandle;
+                if (isSecondParam)
+                    return ParamTypeUnicodeStr;
+                if (isThirdParam)
+                    return ParamTypeFlag;
+                if (isFourthParam)
+                    return ParamTypeFlag;
+                if (isFifthParam)
+                    return ParamTypeAddress;
+                if (isSixthParam)
+                    return ParamTypeBufferSize;
+            }
+
+            if (hasEnumeratePrefix) {
+                if (isFirstParam)
+                    return ParamTypeHandle;
+                if (isSecondParam || isThirdParam)
+                    return ParamTypeFlag;
+                if (isFourthParam)
+                    return ParamTypeAddress;
+                if (isFifthParam)
+                    return ParamTypeBufferSize;
+                if (isSixthParam)
+                    return ParamTypeRetLength;
+            }
+        }
+
+        // Generic create/open family
+        if (hasCreatePrefix || hasOpenPrefix) {
+            if (isFirstParam)
+                return ParamTypeAddress;
+            if (isSecondParam)
+                return ParamTypeAccess;
+            if (isThirdParam)
+                return ParamTypeObjectAttr;
+        }
+
+        // Generic query/get family
         if (hasQueryPrefix || hasGetPrefix) {
             if (isFirstParam) {
-                // Handle for object-specific queries, info class for system-wide
-                return hasInfoTerm ? ParamTypeInfoClass : ParamTypeHandle;
+                if (hasSystemTerm && hasInfoTerm)
+                    return ParamTypeInfoClass;
+                if (hasTokenTerm)
+                    return ParamTypeToken;
+                return ParamTypeHandle;
             }
 
-            if (isSecondParam && hasInfoTerm) {
-                return ParamTypeInfoClass; // Information class
-            }
+            if (isSecondParam && hasInfoTerm)
+                return ParamTypeInfoClass;
 
-            if (isThirdParam) return ParamTypeAddress; // Output buffer
-            if (isFourthParam) return ParamTypeBufferSize; // Buffer size
+            if (isThirdParam)
+                return ParamTypeAddress;
 
-            // Final parameter in query functions often returns length
-            if (isFifthParam && hasInfoTerm) {
+            if (isFourthParam)
+                return ParamTypeBufferSize;
+
+            if (isFifthParam && hasInfoTerm)
                 return ParamTypeRetLength;
-            }
         }
 
-        // Set pattern
+        // Generic set family
         if (hasSetPrefix) {
-            if (isFirstParam) return ParamTypeHandle;
-
-            if (isSecondParam && hasInfoTerm) {
-                return ParamTypeInfoClass; // Information class
+            if (isFirstParam) {
+                if (hasTokenTerm)
+                    return ParamTypeToken;
+                return ParamTypeHandle;
             }
 
-            if (isThirdParam) return ParamTypeAddress; // Input buffer
-            if (isFourthParam) return ParamTypeBufferSize; // Buffer size
-        }
+            if (isSecondParam && hasInfoTerm)
+                return ParamTypeInfoClass;
 
-        // Memory operations
-        if (hasMemoryTerm || hasAllocPrefix || hasFreePrefix) {
-            if (isFirstParam) return ParamTypeHandle; // Process handle
-            if (isSecondParam || isThirdParam) return ParamTypeAddress; // Memory address/pointer
-            if (isFourthParam) return ParamTypeFlag; // Allocation type/flags
-        }
+            if (isThirdParam)
+                return ParamTypeAddress;
 
-        // File operations
-        if (hasFileTerm || hasReadTerm || hasWriteTerm) {
-            if (isFirstParam) return ParamTypeHandle;
-            if (isSecondParam && (hasReadTerm || hasWriteTerm)) {
-                return ParamTypeHandle; // Event handle
-            }
-            if (isFourthParam && hasFileTerm) return ParamTypeStatus; // IO_STATUS_BLOCK
-        }
-
-        // Registry patterns
-        if (hasRegistryTerm) {
-            if (isSecondParam && (hasQueryPrefix || hasSetPrefix)) {
-                return ParamTypeUnicodeStr; // Key name
-            }
-
-            if (hasValueTerm && (isFourthParam || isFifthParam) && hasQueryPrefix) {
-                return ParamTypeKeyValue;
-            }
-        }
-
-        // Process/thread operations
-        if (hasProcessTerm || hasThreadTerm) {
-            if (isFirstParam) return ParamTypeHandle;
-            if (isSecondParam && hasQueryPrefix) return ParamTypeInfoClass;
-        }
-
-        // Token operations
-        if (hasTokenTerm) {
-            if (isFirstParam) return ParamTypeToken;
-            if ((hasSetPrefix || hasQueryPrefix) && isSecondParam) return ParamTypeInfoClass;
-
-            // Special case for token privileges
-            if (hasPrivilegeTerm && isThirdParam) {
-                return ParamTypePrivilege;
-            }
-        }
-
-        // Enumerate patterns
-        if (hasEnumeratePrefix) {
-            if (ParameterIndex >= 1 && ParameterIndex <= 3) return ParamTypeAddress;
+            if (isFourthParam)
+                return ParamTypeBufferSize;
         }
     }
 
-    // Default patterns when no specific rule matches
+    // ============================================================
+    // Defaults
+    // ============================================================
+
     switch (ParameterIndex) {
     case 0:
-        return IsWin32kSyscall ?
-            (isUserFunction ? ParamTypeWinHandle : ParamTypeGdiHandle) :
-            ParamTypeHandle;
+        if (IsWin32kSyscall) {
+            return isUserFunction ? ParamTypeWinHandle : ParamTypeGdiHandle;
+        }
+
+        if (hasSystemTerm && hasInfoTerm && (hasQueryPrefix || hasSetPrefix))
+            return ParamTypeInfoClass;
+
+        if (hasCreatePrefix || hasOpenPrefix)
+            return ParamTypeAddress;
+
+        if (hasTokenTerm)
+            return ParamTypeToken;
+
+        return ParamTypeHandle;
+
     case 1:
-    case 3:
-    case 4:
+        if (!IsWin32kSyscall && (hasCreatePrefix || hasOpenPrefix))
+            return ParamTypeAccess;
+
+        if (!IsWin32kSyscall && hasInfoTerm && (hasQueryPrefix || hasSetPrefix))
+            return ParamTypeInfoClass;
+
         return ParamTypeFlag;
+
     case 2:
         return ParamTypeAddress;
+
+    case 3:
+        if (!IsWin32kSyscall && (hasQueryPrefix || hasGetPrefix))
+            return ParamTypeBufferSize;
+        return ParamTypeFlag;
+
+    case 4:
+        if (!IsWin32kSyscall && hasInfoTerm && (hasQueryPrefix || hasGetPrefix))
+            return ParamTypeRetLength;
+        return ParamTypeFlag;
+
     default:
         return (ParameterIndex % 2) ? ParamTypeFlag : ParamTypeAddress;
     }
+}
+
+NTSTATUS NTAPI FuzzSafeThreadStart(
+    _In_opt_ PVOID Parameter
+)
+{
+    UNREFERENCED_PARAMETER(Parameter);
+    return STATUS_SUCCESS;
+}
+
+BOOL FuzzBuildNtCreateThreadExArguments(
+    _Out_writes_(11) ULONG_PTR* Arguments,
+    _In_ PBYTE FuzzStructBuffer
+)
+{
+    ULONG mutateIndex;
+    SIZE_T stackSize;
+    SIZE_T maximumStackSize;
+    HANDLE* pThreadHandle;
+    OBJECT_ATTRIBUTES* pObjectAttributes;
+    ULONG_PTR createFlags;
+
+    if (Arguments == NULL || FuzzStructBuffer == NULL)
+        return FALSE;
+
+    RtlSecureZeroMemory(Arguments, sizeof(ULONG_PTR) * 11);
+
+    pThreadHandle = (HANDLE*)FuzzGetParameterStructSlot(FuzzStructBuffer, 0);
+    if (pThreadHandle == NULL)
+        return FALSE;
+    *pThreadHandle = NULL;
+
+    pObjectAttributes = (OBJECT_ATTRIBUTES*)FuzzGetParameterStructSlot(FuzzStructBuffer, 2);
+    if (pObjectAttributes)
+        RtlSecureZeroMemory(pObjectAttributes, sizeof(OBJECT_ATTRIBUTES));
+
+    createFlags = 0x00000001ui64;
+    stackSize = 0;
+    maximumStackSize = 0;
+
+    Arguments[0] = (ULONG_PTR)pThreadHandle;
+    Arguments[1] = (ULONG_PTR)THREAD_ALL_ACCESS;
+    Arguments[2] = 0;
+    Arguments[3] = (ULONG_PTR)NtCurrentProcess();
+    Arguments[4] = (ULONG_PTR)FuzzSafeThreadStart;
+    Arguments[5] = 0;
+    Arguments[6] = createFlags;
+    Arguments[7] = (ULONG_PTR)0;
+    Arguments[8] = (ULONG_PTR)stackSize;
+    Arguments[9] = (ULONG_PTR)maximumStackSize;
+    Arguments[10] = 0;
+
+    mutateIndex = FuzzRandom() % 8;
+
+    switch (mutateIndex) {
+
+    case 0:
+        Arguments[1] = FuzzAccessData[FuzzRandom() % FUZZACCESS_COUNT];
+        break;
+
+    case 1:
+        if (pObjectAttributes) {
+            pObjectAttributes->Length = sizeof(OBJECT_ATTRIBUTES);
+            pObjectAttributes->RootDirectory = NULL;
+            pObjectAttributes->ObjectName = NULL;
+            pObjectAttributes->Attributes = (ULONG)FuzzAttrData[FuzzRandom() % FUZZATTR_COUNT];
+            pObjectAttributes->SecurityDescriptor = NULL;
+            pObjectAttributes->SecurityQualityOfService = NULL;
+            Arguments[2] = (ULONG_PTR)pObjectAttributes;
+        }
+        break;
+
+    case 2:
+    {
+        static const ULONG_PTR safeCreateFlags[] = {
+            0x00000001ui64,
+            0x00000001ui64 | 0x00000004ui64,
+            0x00000001ui64 | 0x00000040ui64,
+            0x00000001ui64 | 0x00000080ui64
+        };
+
+        Arguments[6] = safeCreateFlags[FuzzRandom() % RTL_NUMBER_OF(safeCreateFlags)];
+        break;
+    }
+
+    case 3:
+    {
+        static const ULONG_PTR zeroBitsValues[] = {
+            0,
+            1,
+            0x10,
+            0x20,
+            0x1000
+        };
+
+        Arguments[7] = zeroBitsValues[FuzzRandom() % RTL_NUMBER_OF(zeroBitsValues)];
+        break;
+    }
+
+    case 4:
+    {
+        static const SIZE_T stackSizes[] = {
+            0,
+            0x1000,
+            0x2000,
+            0x4000,
+            0x10000
+        };
+
+        Arguments[8] = (ULONG_PTR)stackSizes[FuzzRandom() % RTL_NUMBER_OF(stackSizes)];
+        break;
+    }
+
+    case 5:
+    {
+        static const SIZE_T maxStackSizes[] = {
+            0,
+            0x1000,
+            0x4000,
+            0x10000,
+            0x40000
+        };
+
+        Arguments[9] = (ULONG_PTR)maxStackSizes[FuzzRandom() % RTL_NUMBER_OF(maxStackSizes)];
+        break;
+    }
+
+    case 6:
+    {
+        static const ULONG_PTR safeArguments[] = {
+            0,
+            1,
+            0x1234,
+            0x10000
+        };
+
+        Arguments[5] = safeArguments[FuzzRandom() % RTL_NUMBER_OF(safeArguments)];
+        break;
+    }
+
+    case 7:
+        if ((FuzzRandom() % 4) == 0)
+            Arguments[0] = 0;
+        break;
+    }
+
+    Arguments[6] |= 0x00000001ui64;
+    return TRUE;
 }
 
 /*
@@ -504,150 +1090,233 @@ ULONG_PTR FuzzGenerateParameter(
     _In_ PBYTE FuzzStructBuffer
 )
 {
-    // If heuristics is disabled return random data
+    ULONG variation;
+    PBYTE structSlot;
+
+    structSlot = FuzzGetParameterStructSlot(FuzzStructBuffer, ParameterIndex);
+
     if (!EnableParamsHeuristic) {
-        return FuzzData[__rdtsc() % FUZZDATA_COUNT];
+        return FuzzData[FuzzRandom() % FUZZDATA_COUNT];
     }
 
-    ULONG variation = __rdtsc() % 20;
+    variation = FuzzRandom() % 20;
     if (variation == 0) {
-        return FuzzData[__rdtsc() % FUZZDATA_COUNT]; // 5% chance of using general fuzz data
+        return FuzzData[FuzzRandom() % FUZZDATA_COUNT];
     }
 
-    // For the rest, use type-specific generation
     switch (TypeHint) {
     case ParamTypeAddress:
-        if (variation < 15) { // 75% valid addresses
-            // Allocate memory and return its address for certain indices
-            if (ParameterIndex == 1 || ParameterIndex == 2 || ParameterIndex == 4) {
-                PVOID buffer = VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-                if (buffer) {
-                    RtlSecureZeroMemory(buffer, 4096);
-                    FuzzTrackAllocation(buffer, AllocTypeVirtualAlloc);
-                    return (ULONG_PTR)buffer;
+    {
+        static const ULONG addressBufferSizes[] = {
+            sizeof(ULONG),
+            sizeof(ULONG_PTR),
+            16,
+            32,
+            64,
+            128,
+            256,
+            512,
+            1024,
+            4096
+        };
+
+        ULONG addressMode;
+        ULONG bufferSize;
+        PBYTE buffer;
+
+        addressMode = FuzzRandom() % 10;
+
+        switch (addressMode) {
+        case 0:
+            return 0;
+
+        case 1:
+        case 2:
+        case 3:
+        case 4:
+        case 5:
+        case 6:
+            bufferSize = addressBufferSizes[FuzzRandom() % _countof(addressBufferSizes)];
+            buffer = (PBYTE)VirtualAlloc(NULL, bufferSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            if (buffer) {
+                RtlSecureZeroMemory(buffer, bufferSize);
+                if (!FuzzTrackAllocation(buffer, AllocTypeVirtualAlloc)) {
+                    VirtualFree(buffer, 0, MEM_RELEASE);
+                    return 0;
                 }
+
+                if (bufferSize >= sizeof(ULONG_PTR)) {
+                    if ((FuzzRandom() % 3) == 0) {
+                        *(PULONG_PTR)buffer = FuzzData[FuzzRandom() % FUZZDATA_COUNT];
+                    }
+                }
+
+                if (bufferSize > 16 && (FuzzRandom() % 5) == 0) {
+                    return (ULONG_PTR)(buffer + (((ULONG_PTR)FuzzRandom() % 8) + 1));
+                }
+
+                return (ULONG_PTR)buffer;
             }
+            break;
+
+        case 7:
+            bufferSize = addressBufferSizes[FuzzRandom() % _countof(addressBufferSizes)];
+            buffer = (PBYTE)VirtualAlloc(NULL, bufferSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            if (buffer) {
+                if (!FuzzTrackAllocation(buffer, AllocTypeVirtualAlloc)) {
+                    VirtualFree(buffer, 0, MEM_RELEASE);
+                    return 0;
+                }
+
+                if (bufferSize >= sizeof(ULONG_PTR)) {
+                    *(PULONG_PTR)buffer = 0x4141414141414141ui64;
+                }
+                if (bufferSize >= (2 * sizeof(ULONG_PTR))) {
+                    *(PULONG_PTR)(buffer + bufferSize - sizeof(ULONG_PTR)) = 0x4242424242424242ui64;
+                }
+
+                return (ULONG_PTR)buffer;
+            }
+            break;
         }
-        return FuzzAddrData[__rdtsc() % FUZZADDR_COUNT];
+
+        return FuzzAddrData[FuzzRandom() % FUZZADDR_COUNT];
+    }
 
     case ParamTypeHandle:
-        return FuzzHandleData[__rdtsc() % FUZZHANDLE_COUNT];
+        return FuzzHandleData[FuzzRandom() % FUZZHANDLE_COUNT];
 
     case ParamTypeStatus:
-        // 25% chance of using fuzzed IO_STATUS_BLOCK
-        if (variation < 5) {
-            return (ULONG_PTR)CreateFuzzedIoStatusBlock(FuzzStructBuffer);
+        if (variation < 5 && structSlot) {
+            return (ULONG_PTR)CreateFuzzedIoStatusBlock(structSlot, FuzzGetRemainingSlotSize(ParameterIndex));
         }
-        return FuzzStatusData[__rdtsc() % FUZZSTATUS_COUNT];
+        return FuzzStatusData[FuzzRandom() % FUZZSTATUS_COUNT];
 
     case ParamTypeAccess:
-        return FuzzAccessData[__rdtsc() % FUZZACCESS_COUNT];
+        return FuzzAccessData[FuzzRandom() % FUZZACCESS_COUNT];
 
     case ParamTypeFlag:
         if (variation < 15) {
-            ULONG numBits = (__rdtsc() % 3) + 1;
-            ULONG_PTR result = 0;
-            ULONG usedBits = 0;
+            ULONG numBits;
             ULONG bit;
+            ULONG_PTR result;
+            ULONG_PTR usedBits;
+            ULONG maxBits;
+            ULONG i;
 
-            for (ULONG i = 0; i < numBits; i++) {
+            numBits = (FuzzRandom() % 3) + 1;
+            result = 0;
+            usedBits = 0;
+            maxBits = (ULONG)(sizeof(ULONG_PTR) * 8);
+
+            for (i = 0; i < numBits; i++) {
                 do {
-                    bit = __rdtsc() % 32;
-                } while (usedBits & (1 << bit));
-                usedBits |= (1 << bit);
-                result |= (1ULL << bit);
+                    bit = FuzzRandom() % maxBits;
+                } while (usedBits & ((ULONG_PTR)1 << bit));
+
+                usedBits |= ((ULONG_PTR)1 << bit);
+                result |= ((ULONG_PTR)1 << bit);
             }
 
             return result;
         }
-        return FuzzData[__rdtsc() % FUZZDATA_COUNT];
+        return FuzzData[FuzzRandom() % FUZZDATA_COUNT];
 
     case ParamTypeUnicodeStr:
-        return (ULONG_PTR)CreateFuzzedUnicodeString(FuzzStructBuffer);
+        return structSlot ? (ULONG_PTR)CreateFuzzedUnicodeString(structSlot, FuzzGetRemainingSlotSize(ParameterIndex)) : 0;
 
     case ParamTypeObjectAttr:
-        return (ULONG_PTR)CreateFuzzedObjectAttributes(FuzzStructBuffer);
+        return structSlot ? (ULONG_PTR)CreateFuzzedObjectAttributes(structSlot, FuzzGetRemainingSlotSize(ParameterIndex)) : 0;
 
     case ParamTypeToken:
-        return FuzzTokenData[__rdtsc() % FUZZTOKEN_COUNT];
+        return FuzzTokenData[FuzzRandom() % FUZZTOKEN_COUNT];
 
     case ParamTypePrivilege:
-        return (ULONG_PTR)CreateFuzzedTokenPrivileges(FuzzStructBuffer);
+        return structSlot ? (ULONG_PTR)CreateFuzzedTokenPrivileges(structSlot, FuzzGetRemainingSlotSize(ParameterIndex)) : 0;
 
     case ParamTypeInfoClass:
-        return FuzzInfoClassData[__rdtsc() % FUZZINFOCLASS_COUNT];
+        return FuzzInfoClassData[FuzzRandom() % FUZZINFOCLASS_COUNT];
 
     case ParamTypeBufferSize:
-        return FuzzBufSizeData[__rdtsc() % FUZZBUFSIZE_COUNT];
+        return FuzzBufSizeData[FuzzRandom() % FUZZBUFSIZE_COUNT];
 
     case ParamTypeTimeout:
-        // Use LARGE_INTEGER for timeouts
-        if (variation < 15) { // 75% of the time use proper time structure
-            return (ULONG_PTR)CreateFuzzedLargeInteger(FuzzStructBuffer);
+        if (variation < 15) {
+            return structSlot ? (ULONG_PTR)CreateFuzzedLargeInteger(structSlot, FuzzGetRemainingSlotSize(ParameterIndex)) : 0;
         }
         else {
             static const ULONG timeoutValues[] = {
                 0, 1, 10, 100, 1000, 10000, 60000,
-                0x7FFFFFFF, 0xFFFFFFFF, 0x80000000 };
-            return timeoutValues[__rdtsc() % _countof(timeoutValues)];
+                0x7FFFFFFF, 0xFFFFFFFF, 0x80000000
+            };
+            return timeoutValues[FuzzRandom() % _countof(timeoutValues)];
         }
 
     case ParamTypeRetLength:
-        if (__rdtsc() % 10 == 0) {
-            return 0; // NULL 10% of the time
+        if ((FuzzRandom() % 10) == 0) {
+            return 0;
         }
         else {
-            PULONG pLength = (PULONG)VirtualAlloc(NULL, sizeof(ULONG),
+            PULONG pLength;
+
+            pLength = (PULONG)VirtualAlloc(NULL, sizeof(ULONG),
                 MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+
             if (pLength) {
                 *pLength = 0;
-                FuzzTrackAllocation(pLength, AllocTypeVirtualAlloc);
+                if (!FuzzTrackAllocation(pLength, AllocTypeVirtualAlloc)) {
+                    VirtualFree(pLength, 0, MEM_RELEASE);
+                    return 0;
+                }
                 return (ULONG_PTR)pLength;
             }
             return 0;
         }
 
     case ParamTypeWinHandle:
-        return FuzzWin32Data[__rdtsc() % FUZZWIN32_COUNT];
+        return FuzzWin32Data[FuzzRandom() % FUZZWIN32_COUNT];
 
     case ParamTypeGdiHandle:
-        return FuzzGdiData[__rdtsc() % FUZZGDI_COUNT];
+        return FuzzGdiData[FuzzRandom() % FUZZGDI_COUNT];
 
     case ParamTypeSecDesc:
-        return (ULONG_PTR)CreateFuzzedSecurityDescriptor(FuzzStructBuffer);
+        return structSlot ? (ULONG_PTR)CreateFuzzedSecurityDescriptor(structSlot, FuzzGetRemainingSlotSize(ParameterIndex)) : 0;
 
     case ParamTypeClientId:
-        return (ULONG_PTR)CreateFuzzedClientId(FuzzStructBuffer);
+        return structSlot ? (ULONG_PTR)CreateFuzzedClientId(structSlot, FuzzGetRemainingSlotSize(ParameterIndex)) : 0;
 
     case ParamTypeKeyValue:
-        return (ULONG_PTR)CreateFuzzedKeyValueParameter();      
+        return (ULONG_PTR)CreateFuzzedKeyValueParameter();
 
     case ParamTypeOutPtr:
-        // Output pointers should be writable memory of varying sizes
     {
-        // Different possible output pointer sizes to fuzz
         static const ULONG outPtrSizes[] = {
-            sizeof(ULONG),        
-            sizeof(HANDLE),       
+            sizeof(ULONG),
+            sizeof(HANDLE),
             sizeof(LARGE_INTEGER),
-            32,                   // Medium structure
-            64,                   // Medium structure
-            128,                  // Medium-large structure
-            512,                  // Large structure
-            1024,                 // Very large structure
-            4096                  // Page-sized structure
+            32,
+            64,
+            128,
+            512,
+            1024,
+            4096
         };
 
-        ULONG bufferSize = outPtrSizes[__rdtsc() % _countof(outPtrSizes)];
-        PVOID buffer = VirtualAlloc(NULL, bufferSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        ULONG bufferSize;
+        PVOID buffer;
+
+        bufferSize = outPtrSizes[FuzzRandom() % _countof(outPtrSizes)];
+        buffer = VirtualAlloc(NULL, bufferSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 
         if (buffer) {
             RtlSecureZeroMemory(buffer, bufferSize);
-            FuzzTrackAllocation(buffer, AllocTypeVirtualAlloc);
+            if (!FuzzTrackAllocation(buffer, AllocTypeVirtualAlloc)) {
+                VirtualFree(buffer, 0, MEM_RELEASE);
+                return 0;
+            }
 
-            // For small buffers, sometimes initialize with recognizable patterns
-            if (bufferSize <= 8 && (__rdtsc() % 2) == 0) {
-                *(PULONG_PTR)buffer = 0xBADF00DCAFEBABE;
+            if (bufferSize <= sizeof(ULONG_PTR) && (FuzzRandom() % 2) == 0) {
+                *(PULONG_PTR)buffer = (ULONG_PTR)0xBADF00DCAFEBABEui64;
             }
 
             return (ULONG_PTR)buffer;
@@ -657,30 +1326,30 @@ ULONG_PTR FuzzGenerateParameter(
 
     case ParamTypeGeneral:
     default:
-        // Context-sensitive guessing for general parameters
-        if (ParameterIndex >= 2 && ParameterIndex <= 4 && variation < 5) {
-            // For indexes 2-4, sometimes use other complex structures that might be relevant
-            ULONG structType = __rdtsc() % 3;
+        if (ParameterIndex >= 2 && ParameterIndex <= 4 && variation < 5 && structSlot) {
+            ULONG structType;
+
+            structType = FuzzRandom() % 3;
 
             switch (structType) {
             case 0:
-                return (ULONG_PTR)CreateFuzzedProcessTimes(FuzzStructBuffer);
+                return (ULONG_PTR)CreateFuzzedProcessTimes(structSlot, FuzzGetRemainingSlotSize(ParameterIndex));
             case 1:
-                return (ULONG_PTR)CreateFuzzedSectionImageInfo(FuzzStructBuffer);
+                return (ULONG_PTR)CreateFuzzedSectionImageInfo(structSlot, FuzzGetRemainingSlotSize(ParameterIndex));
             case 2:
-                return (ULONG_PTR)CreateFuzzedLargeInteger(FuzzStructBuffer);
+                return (ULONG_PTR)CreateFuzzedLargeInteger(structSlot, FuzzGetRemainingSlotSize(ParameterIndex));
             }
         }
 
         if (IsWin32kSyscall && variation < 10) {
-            if (__rdtsc() % 2 == 0) {
-                return FuzzWin32Data[__rdtsc() % FUZZWIN32_COUNT];
+            if ((FuzzRandom() % 2) == 0) {
+                return FuzzWin32Data[FuzzRandom() % FUZZWIN32_COUNT];
             }
             else {
-                return FuzzGdiData[__rdtsc() % FUZZGDI_COUNT];
+                return FuzzGdiData[FuzzRandom() % FUZZGDI_COUNT];
             }
         }
-        return FuzzData[__rdtsc() % FUZZDATA_COUNT];
+        return FuzzData[FuzzRandom() % FUZZDATA_COUNT];
     }
 }
 
@@ -724,56 +1393,64 @@ VOID FuzzDetectParameterTypes(
 *
 */
 PSECURITY_DESCRIPTOR CreateFuzzedSecurityDescriptor(
-    _In_ BYTE* FuzzStructBuffer
+    _In_ BYTE* FuzzStructBuffer,
+    _In_ SIZE_T BufferSize
 )
 {
+    DWORD dwAclSize;
+    ULONG mode;
+    BOOL bResult = FALSE;
     PSECURITY_DESCRIPTOR pSD;
     PACL pAcl = NULL;
-    DWORD dwAclSize;
-    ULONG mode = __rdtsc() % 8;
-    BOOL bResult = FALSE;
     SID_IDENTIFIER_AUTHORITY SIDAuthWorld = SECURITY_WORLD_SID_AUTHORITY;
     SID_IDENTIFIER_AUTHORITY SIDAuthNT = SECURITY_NT_AUTHORITY;
     PSID pEveryoneSid = NULL;
     PSID pSystemSid = NULL;
 
-    pSD = (PSECURITY_DESCRIPTOR)FuzzStructBuffer;
-
-    switch (mode) {
-    case 0: // NULL security descriptor
+    if (FuzzStructBuffer == NULL || BufferSize < SECURITY_DESCRIPTOR_MIN_LENGTH)
         return NULL;
 
-    case 1: // Invalid security descriptor
-        return (PSECURITY_DESCRIPTOR)FuzzAddrData[__rdtsc() % FUZZADDR_COUNT];
+    pSD = (PSECURITY_DESCRIPTOR)FuzzStructBuffer;
+    mode = (ULONG)(FuzzRandom() % 8);
 
-    case 2: // Empty but initialized security descriptor
+    RtlSecureZeroMemory(pSD, SECURITY_DESCRIPTOR_MIN_LENGTH);
+
+    switch (mode) {
+    case 0:
+        return NULL;
+
+    case 1:
+        return (PSECURITY_DESCRIPTOR)FuzzAddrData[FuzzRandom() % FUZZADDR_COUNT];
+
+    case 2:
         if (!InitializeSecurityDescriptor(pSD, SECURITY_DESCRIPTOR_REVISION))
             return NULL;
         return pSD;
 
-    case 3: // Security descriptor with NULL DACL (everyone access)
+    case 3:
         if (!InitializeSecurityDescriptor(pSD, SECURITY_DESCRIPTOR_REVISION))
             return NULL;
 
         bResult = SetSecurityDescriptorDacl(pSD, TRUE, NULL, FALSE);
         return bResult ? pSD : NULL;
 
-    case 4: // Security descriptor with Deny-All DACL
+    case 4:
         if (!InitializeSecurityDescriptor(pSD, SECURITY_DESCRIPTOR_REVISION))
             return NULL;
 
-        // Create a PSID for Everyone
         if (!AllocateAndInitializeSid(&SIDAuthWorld, 1, SECURITY_WORLD_RID, 0, 0, 0, 0, 0, 0, 0, &pEveryoneSid))
             return NULL;
 
-        // Create a deny-all ACL
         dwAclSize = sizeof(ACL) + sizeof(ACCESS_DENIED_ACE) + GetLengthSid(pEveryoneSid);
         pAcl = (PACL)VirtualAlloc(NULL, dwAclSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         if (pAcl) {
-            FuzzTrackAllocation(pAcl, AllocTypeVirtualAlloc);
+            if (!FuzzTrackAllocation(pAcl, AllocTypeVirtualAlloc)) {
+                VirtualFree(pAcl, 0, MEM_RELEASE);
+                FreeSid(pEveryoneSid);
+                return NULL;
+            }
 
             if (InitializeAcl(pAcl, dwAclSize, ACL_REVISION)) {
-                // Add a deny ACE for Everyone
                 if (AddAccessDeniedAce(pAcl, ACL_REVISION, GENERIC_ALL, pEveryoneSid)) {
                     if (SetSecurityDescriptorDacl(pSD, TRUE, pAcl, FALSE)) {
                         FreeSid(pEveryoneSid);
@@ -785,39 +1462,41 @@ PSECURITY_DESCRIPTOR CreateFuzzedSecurityDescriptor(
         }
         return NULL;
 
-    case 5: // Security descriptor with owner but no DACL
+    case 5:
         if (!InitializeSecurityDescriptor(pSD, SECURITY_DESCRIPTOR_REVISION))
             return NULL;
 
-        // Create a PSID for Local System
         if (!AllocateAndInitializeSid(&SIDAuthNT, 1, SECURITY_LOCAL_SYSTEM_RID, 0, 0, 0, 0, 0, 0, 0, &pSystemSid))
             return NULL;
 
         if (SetSecurityDescriptorOwner(pSD, pSystemSid, FALSE)) {
-            // Note: We intentionally leak the SID here for fuzzing purposes
-            FuzzTrackAllocation(pSystemSid, AllocTypeSid);
+            if (!FuzzTrackAllocation(pSystemSid, AllocTypeSid)) {
+                FreeSid(pSystemSid);
+                return NULL;
+            }
             return pSD;
         }
+
         FreeSid(pSystemSid);
         return NULL;
 
-    case 6: // Invalid security descriptor with bad revision
-        if (!InitializeSecurityDescriptor(pSD, 0xFF)) // Bad revision number
+    case 6:
+        if (!InitializeSecurityDescriptor(pSD, 0xFF))
             return NULL;
         return pSD;
 
-    case 7: // Security descriptor with corrupted control bits
+    case 7:
         if (!InitializeSecurityDescriptor(pSD, SECURITY_DESCRIPTOR_REVISION))
             return NULL;
 
-        *(USHORT*)((PUCHAR)pSD + 2) = 0xFFFF; // Corrupt control bits
+        *(USHORT*)((PUCHAR)pSD + 2) = 0xFFFF;
         return pSD;
 
-    default: // Minimal valid security descriptor
+    default:
         if (!InitializeSecurityDescriptor(pSD, SECURITY_DESCRIPTOR_REVISION))
             return NULL;
 
-        SetSecurityDescriptorDacl(pSD, TRUE, NULL, FALSE);
+        SetSecurityDescriptorDacl(pSD, TRUE, NULL, FALSE); //-V530
         SetSecurityDescriptorSacl(pSD, FALSE, NULL, FALSE);
         return pSD;
     }
@@ -832,119 +1511,159 @@ PSECURITY_DESCRIPTOR CreateFuzzedSecurityDescriptor(
 *
 */
 PUNICODE_STRING CreateFuzzedUnicodeString(
-    _In_ BYTE* FuzzStructBuffer
+    _In_ BYTE* FuzzStructBuffer,
+    _In_ SIZE_T BufferSize
 )
 {
-    PUNICODE_STRING UnicodeString;
-    PWSTR buffer = NULL, stringBuf;
     USHORT length = 0, maxLength = 0;
-    ULONG mode = __rdtsc() % 16;
+    ULONG mode;
+    PUNICODE_STRING UnicodeString;
+    PWSTR buffer = NULL;
+    PWSTR stringBuf;
+    SIZE_T charsAvailable;
 
-    UnicodeString = (PUNICODE_STRING)FuzzStructBuffer;
-    stringBuf = (PWSTR)(FuzzStructBuffer + sizeof(UNICODE_STRING));
-
-    // Create different variants of UNICODE_STRING
-    switch (mode) {
-    case 0: // NULL structure
+    if (FuzzStructBuffer == NULL || BufferSize < sizeof(UNICODE_STRING))
         return NULL;
 
-    case 1: // Valid empty string
+    UnicodeString = (PUNICODE_STRING)FuzzStructBuffer;
+    mode = (ULONG)(FuzzRandom() % 16);
+
+    RtlSecureZeroMemory(UnicodeString, sizeof(UNICODE_STRING));
+    stringBuf = (PWSTR)(FuzzStructBuffer + sizeof(UNICODE_STRING));
+    charsAvailable = (BufferSize > sizeof(UNICODE_STRING)) ?
+        ((BufferSize - sizeof(UNICODE_STRING)) / sizeof(WCHAR)) : 0;
+
+    switch (mode) {
+    case 0:
+        return NULL;
+
+    case 1:
         length = 0;
         maxLength = 0;
         buffer = NULL;
         break;
 
-    case 2: // Valid string with content for file paths
-        _strcpy_w((PWSTR)stringBuf, L"\\??\\C:\\Windows\\System32\\kernel32.dll");
-        length = (USHORT)(_strlen_w((PWSTR)stringBuf) * sizeof(WCHAR));
+    case 2:
+        if (charsAvailable < RTL_NUMBER_OF(L"\\??\\C:\\Windows\\System32\\kernel32.dll"))
+            return NULL;
+
+        _strcpy_w(stringBuf, L"\\??\\C:\\Windows\\System32\\kernel32.dll");
+        length = (USHORT)(_strlen_w(stringBuf) * sizeof(WCHAR));
         maxLength = length + sizeof(WCHAR);
-        buffer = (PWSTR)stringBuf;
+        buffer = stringBuf;
         break;
 
-    case 3: // Valid string with registry path
-        _strcpy_w((PWSTR)stringBuf, L"\\Registry\\Machine\\Software\\Microsoft\\Windows NT\\CurrentVersion");
-        length = (USHORT)(_strlen_w((PWSTR)stringBuf) * sizeof(WCHAR));
+    case 3:
+        if (charsAvailable < RTL_NUMBER_OF(L"\\Registry\\Machine\\Software\\Microsoft\\Windows NT\\CurrentVersion"))
+            return NULL;
+
+        _strcpy_w(stringBuf, L"\\Registry\\Machine\\Software\\Microsoft\\Windows NT\\CurrentVersion");
+        length = (USHORT)(_strlen_w(stringBuf) * sizeof(WCHAR));
         maxLength = length + sizeof(WCHAR);
-        buffer = (PWSTR)stringBuf;
+        buffer = stringBuf;
         break;
 
-    case 4: // Invalid: Length > MaximumLength
-        _strcpy_w((PWSTR)stringBuf, L"BadString");
+    case 4:
+        if (charsAvailable < RTL_NUMBER_OF(L"BadString"))
+            return NULL;
+
+        _strcpy_w(stringBuf, L"BadString");
         length = 20;
         maxLength = 10;
-        buffer = (PWSTR)stringBuf;
+        buffer = stringBuf;
         break;
 
-    case 5: // Invalid: NULL buffer with non-zero length
+    case 5:
         length = 10;
         maxLength = 10;
         buffer = NULL;
         break;
 
-    case 6: // Invalid: Bad pointer
+    case 6:
         length = 10;
         maxLength = 10;
-        buffer = (PWSTR)FuzzAddrData[__rdtsc() % FUZZADDR_COUNT];
+        buffer = (PWSTR)FuzzAddrData[FuzzRandom() % FUZZADDR_COUNT];
         break;
 
-    case 7: // Odd lengths (unaligned)
-        _strcpy_w((PWSTR)stringBuf, L"OddString");
-        length = 7; // Intentionally wrong
+    case 7:
+        if (charsAvailable < RTL_NUMBER_OF(L"OddString"))
+            return NULL;
+
+        _strcpy_w(stringBuf, L"OddString");
+        length = 7;
         maxLength = 7;
-        buffer = (PWSTR)stringBuf;
+        buffer = stringBuf;
         break;
 
-    case 8: // Very long string (boundary testing)
+    case 8:
     {
-        PWCHAR p = (PWCHAR)stringBuf;
-        for (ULONG i = 0; i < 500; i++) {
-            *p++ = L'A' + (i % 26);
+        PWCHAR p;
+        ULONG i, maxChars;
+
+        if (charsAvailable < 2)
+            return NULL;
+
+        p = (PWCHAR)stringBuf;
+        maxChars = (ULONG)((charsAvailable - 1) < 500 ? (charsAvailable - 1) : 500);
+
+        for (i = 0; i < maxChars; i++) {
+            *p++ = (WCHAR)(L'A' + (i % 26));
         }
         *p = 0;
-        length = 1000;
-        maxLength = 1020;
-        buffer = (PWSTR)stringBuf;
+
+        length = (USHORT)(maxChars * sizeof(WCHAR));
+        maxLength = (USHORT)((maxChars + 1) * sizeof(WCHAR));
+        buffer = stringBuf;
     }
     break;
 
-    case 9: // String with special characters
-        _strcpy_w((PWSTR)stringBuf, L"%s%n%p\x0000\x0001\xFFFF\t\r\n");
-        length = (USHORT)(_strlen_w((PWSTR)stringBuf) * sizeof(WCHAR));
+    case 9:
+        if (charsAvailable < RTL_NUMBER_OF(L"%s%n%p\x0000\x0001\xFFFF\t\r\n"))
+            return NULL;
+
+        _strcpy_w(stringBuf, L"%s%n%p\x0000\x0001\xFFFF\t\r\n");
+        length = (USHORT)(_strlen_w(stringBuf) * sizeof(WCHAR));
         maxLength = length + sizeof(WCHAR);
-        buffer = (PWSTR)stringBuf;
+        buffer = stringBuf;
         break;
 
-    case 10: // String points to self
+    case 10:
         UnicodeString->Length = sizeof(UNICODE_STRING);
         UnicodeString->MaximumLength = sizeof(UNICODE_STRING);
         UnicodeString->Buffer = (PWSTR)UnicodeString;
-        break;
+        return UnicodeString;
 
-    case 11: // Buffer points inside parent
+    case 11:
         length = 6;
         maxLength = 8;
         buffer = (PWSTR)((BYTE*)UnicodeString - 4);
         break;
 
-    case 12: // Buffer is unaligned
+    case 12:
+        if (charsAvailable == 0)
+            return NULL;
+
         length = 8;
         maxLength = 16;
         buffer = (PWSTR)(((ULONG_PTR)stringBuf) | 1);
         break;
 
-    case 13: // Length/MaximumLength overflows
+    case 13:
         length = (USHORT)0xFFFF;
-        maxLength = (USHORT)0x0000; // wrap-around
+        maxLength = (USHORT)0x0000;
         buffer = stringBuf;
         break;
 
-    case 14: // All fields are 0xFF
+    case 14:
         memset(UnicodeString, 0xFF, sizeof(UNICODE_STRING));
         return UnicodeString;
 
-    case 15: // Length not multiple of WCHAR
+    case 15:
+        if (charsAvailable < RTL_NUMBER_OF(L"ABC"))
+            return NULL;
+
         _strcpy_w(stringBuf, L"ABC");
-        length = 3; // Not divisible by 2
+        length = 3;
         maxLength = 5;
         buffer = stringBuf;
         break;
@@ -966,26 +1685,34 @@ PUNICODE_STRING CreateFuzzedUnicodeString(
 *
 */
 POBJECT_ATTRIBUTES CreateFuzzedObjectAttributes(
-    _In_ BYTE* FuzzStructBuffer
+    _In_ BYTE* FuzzStructBuffer,
+    _In_ SIZE_T BufferSize
 )
 {
+    ULONG mode;
+    SIZE_T remainSize;
     POBJECT_ATTRIBUTES ObjectAttributes;
     PUNICODE_STRING ObjectName;
     PBYTE stringBuffer;
-    ULONG mode = __rdtsc() % 8;
 
-    ObjectAttributes = (POBJECT_ATTRIBUTES)FuzzStructBuffer;
-    stringBuffer = (PBYTE)FuzzStructBuffer + sizeof(OBJECT_ATTRIBUTES);
-
-    // Create fuzzed object name
-    ObjectName = CreateFuzzedUnicodeString(stringBuffer);
-
-    // Create different variants
-    switch (mode) {
-    case 0: // NULL structure
+    if (FuzzStructBuffer == NULL || BufferSize < sizeof(OBJECT_ATTRIBUTES))
         return NULL;
 
-    case 1: // Invalid length
+    mode = (ULONG)(FuzzRandom() % 8);
+
+    ObjectAttributes = (POBJECT_ATTRIBUTES)FuzzStructBuffer;
+    RtlSecureZeroMemory(ObjectAttributes, sizeof(OBJECT_ATTRIBUTES));
+
+    stringBuffer = (PBYTE)FuzzStructBuffer + sizeof(OBJECT_ATTRIBUTES);
+    remainSize = BufferSize - sizeof(OBJECT_ATTRIBUTES);
+
+    ObjectName = CreateFuzzedUnicodeString(stringBuffer, remainSize);
+
+    switch (mode) {
+    case 0:
+        return NULL;
+
+    case 1:
         ObjectAttributes->Length = sizeof(OBJECT_ATTRIBUTES) + 100;
         ObjectAttributes->RootDirectory = NULL;
         ObjectAttributes->ObjectName = ObjectName;
@@ -994,47 +1721,48 @@ POBJECT_ATTRIBUTES CreateFuzzedObjectAttributes(
         ObjectAttributes->SecurityQualityOfService = NULL;
         break;
 
-    case 2: // Valid but with random attributes
+    case 2:
         ObjectAttributes->Length = sizeof(OBJECT_ATTRIBUTES);
         ObjectAttributes->RootDirectory = NULL;
         ObjectAttributes->ObjectName = ObjectName;
-        ObjectAttributes->Attributes = (ULONG)FuzzAttrData[__rdtsc() % FUZZATTR_COUNT];
+        ObjectAttributes->Attributes = (ULONG)FuzzAttrData[FuzzRandom() % FUZZATTR_COUNT];
         ObjectAttributes->SecurityDescriptor = NULL;
         ObjectAttributes->SecurityQualityOfService = NULL;
         break;
 
-    case 3: // Invalid security descriptor
+    case 3:
         ObjectAttributes->Length = sizeof(OBJECT_ATTRIBUTES);
         ObjectAttributes->RootDirectory = NULL;
         ObjectAttributes->ObjectName = ObjectName;
         ObjectAttributes->Attributes = 0;
-        ObjectAttributes->SecurityDescriptor = (PVOID)FuzzAddrData[__rdtsc() % FUZZADDR_COUNT];
+        ObjectAttributes->SecurityDescriptor = (PVOID)FuzzAddrData[FuzzRandom() % FUZZADDR_COUNT];
         ObjectAttributes->SecurityQualityOfService = NULL;
         break;
 
-    case 4: // All fields fuzzed
-        ObjectAttributes->Length = (__rdtsc() % 2 == 0) ? sizeof(OBJECT_ATTRIBUTES) : (__rdtsc() % 256);
-        ObjectAttributes->RootDirectory = (HANDLE)FuzzHandleData[__rdtsc() % FUZZHANDLE_COUNT];
+    case 4:
+        ObjectAttributes->Length = ((FuzzRandom() % 2) == 0) ?
+            sizeof(OBJECT_ATTRIBUTES) : (ULONG)(FuzzRandom() % 256);
+        ObjectAttributes->RootDirectory = (HANDLE)FuzzHandleData[FuzzRandom() % FUZZHANDLE_COUNT];
         ObjectAttributes->ObjectName = ObjectName;
-        ObjectAttributes->Attributes = (ULONG)FuzzAttrData[__rdtsc() % FUZZATTR_COUNT];
-        ObjectAttributes->SecurityDescriptor = (PVOID)FuzzAddrData[__rdtsc() % FUZZADDR_COUNT];
-        ObjectAttributes->SecurityQualityOfService = (PVOID)FuzzAddrData[__rdtsc() % FUZZADDR_COUNT];
+        ObjectAttributes->Attributes = (ULONG)FuzzAttrData[FuzzRandom() % FUZZATTR_COUNT];
+        ObjectAttributes->SecurityDescriptor = (PVOID)FuzzAddrData[FuzzRandom() % FUZZADDR_COUNT];
+        ObjectAttributes->SecurityQualityOfService = (PVOID)FuzzAddrData[FuzzRandom() % FUZZADDR_COUNT];
         break;
 
-    case 5: // All fields are 0xAA
+    case 5:
         memset(ObjectAttributes, 0xAA, sizeof(OBJECT_ATTRIBUTES));
         break;
 
-    case 6: // ObjectName points to ObjectAttributes itself
+    case 6:
         ObjectAttributes->Length = sizeof(OBJECT_ATTRIBUTES);
-        ObjectAttributes->ObjectName = (PUNICODE_STRING)ObjectAttributes;
+        ObjectAttributes->ObjectName = (PUNICODE_STRING)ObjectAttributes; //-V1027
         ObjectAttributes->RootDirectory = NULL;
         ObjectAttributes->Attributes = 0;
         ObjectAttributes->SecurityDescriptor = NULL;
         ObjectAttributes->SecurityQualityOfService = NULL;
         break;
 
-    case 7: // ObjectName NULL, Length valid
+    case 7:
         ObjectAttributes->Length = sizeof(OBJECT_ATTRIBUTES);
         ObjectAttributes->ObjectName = NULL;
         ObjectAttributes->RootDirectory = NULL;
@@ -1056,31 +1784,38 @@ POBJECT_ATTRIBUTES CreateFuzzedObjectAttributes(
 *
 */
 PTOKEN_PRIVILEGES CreateFuzzedTokenPrivileges(
-    _In_ BYTE* FuzzStructBuffer
+    _In_ BYTE* FuzzStructBuffer,
+    _In_ SIZE_T BufferSize
 )
 {
+    ULONG i, variation, maxPrivileges, actualCount;
     PTOKEN_PRIVILEGES pPrivileges;
-    ULONG variation;
-    ULONG i, maxPrivileges, actualCount;
 
-    maxPrivileges = (MAX_STRUCT_BUFFER_SIZE - sizeof(ULONG)) / sizeof(LUID_AND_ATTRIBUTES);
+    if (FuzzStructBuffer == NULL || BufferSize < sizeof(ULONG))
+        return NULL;
 
-    // Use high variation for more patterns
-    variation = __rdtsc() % 16;
+    maxPrivileges = (ULONG)((BufferSize - sizeof(ULONG)) / sizeof(LUID_AND_ATTRIBUTES));
+    variation = (ULONG)(FuzzRandom() % 16);
 
-    // Base struct at start of buffer
     pPrivileges = (PTOKEN_PRIVILEGES)FuzzStructBuffer;
+    RtlSecureZeroMemory(pPrivileges, BufferSize);
 
     switch (variation) {
-    case 0: // Valid privilege structure - single privilege
+    case 0:
+        if (maxPrivileges < 1)
+            return NULL;
+
         pPrivileges->PrivilegeCount = 1;
         pPrivileges->Privileges[0].Luid.LowPart = SE_DEBUG_PRIVILEGE;
         pPrivileges->Privileges[0].Luid.HighPart = 0;
         pPrivileges->Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
         break;
 
-    case 1: // Valid privilege structure - multiple privileges
-        actualCount = (maxPrivileges >= 3) ? 3 : 1;
+    case 1:
+        if (maxPrivileges < 3)
+            return NULL;
+
+        actualCount = 3;
         pPrivileges->PrivilegeCount = actualCount;
         for (i = 0; i < actualCount; ++i) {
             pPrivileges->Privileges[i].Luid.LowPart = SE_DEBUG_PRIVILEGE + i;
@@ -1089,57 +1824,72 @@ PTOKEN_PRIVILEGES CreateFuzzedTokenPrivileges(
         }
         break;
 
-    case 2: // Valid structure with zero count (edge case)
+    case 2:
         pPrivileges->PrivilegeCount = 0;
         break;
 
-    case 3: // Invalid - count too high
-        actualCount = maxPrivileges - 1;
-        pPrivileges->PrivilegeCount = actualCount;
+    case 3:
+        pPrivileges->PrivilegeCount = maxPrivileges + 1;
+        actualCount = maxPrivileges;
         for (i = 0; i < actualCount; ++i) {
-            pPrivileges->Privileges[i].Luid.LowPart = (ULONG)(__rdtsc() % 35);
+            pPrivileges->Privileges[i].Luid.LowPart = (ULONG)(FuzzRandom() % 35);
             pPrivileges->Privileges[i].Luid.HighPart = 0;
-            pPrivileges->Privileges[i].Attributes = (__rdtsc() & 1) ? SE_PRIVILEGE_ENABLED : 0;
+            pPrivileges->Privileges[i].Attributes = ((FuzzRandom() & 1) ? SE_PRIVILEGE_ENABLED : 0);
         }
         break;
 
-    case 4: // Zero attributes 
+    case 4:
+        if (maxPrivileges < 1)
+            return NULL;
+
         pPrivileges->PrivilegeCount = 1;
         pPrivileges->Privileges[0].Luid.LowPart = SE_DEBUG_PRIVILEGE;
         pPrivileges->Privileges[0].Luid.HighPart = 0;
-        pPrivileges->Privileges[0].Attributes = 0; // No attributes
+        pPrivileges->Privileges[0].Attributes = 0;
         break;
 
-    case 5: // All attributes set 
+    case 5:
+        if (maxPrivileges < 1)
+            return NULL;
+
         pPrivileges->PrivilegeCount = 1;
         pPrivileges->Privileges[0].Luid.LowPart = SE_DEBUG_PRIVILEGE;
         pPrivileges->Privileges[0].Luid.HighPart = 0;
-        pPrivileges->Privileges[0].Attributes = 0xFFFFFFFF; // All bits set
+        pPrivileges->Privileges[0].Attributes = 0xFFFFFFFF;
         break;
 
-    case 6: // Invalid LUIDs (high part)
+    case 6:
+        if (maxPrivileges < 1)
+            return NULL;
+
         pPrivileges->PrivilegeCount = 1;
         pPrivileges->Privileges[0].Luid.LowPart = SE_DEBUG_PRIVILEGE;
-        pPrivileges->Privileges[0].Luid.HighPart = 0xFFFFFFFF; // Invalid high part
+        pPrivileges->Privileges[0].Luid.HighPart = 0xFFFFFFFF;
         pPrivileges->Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
         break;
 
-    case 7: // Unusual privileges
+    case 7:
+        if (maxPrivileges < 1)
+            return NULL;
+
         pPrivileges->PrivilegeCount = 1;
-        pPrivileges->Privileges[0].Luid.LowPart = 0xFFFF; // Very high privilege number
+        pPrivileges->Privileges[0].Luid.LowPart = 0xFFFF;
         pPrivileges->Privileges[0].Luid.HighPart = 0;
         pPrivileges->Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
         break;
 
-    case 8: // NULL struct - rarely valid
+    case 8:
         return NULL;
 
-    case 9: // Boundary case - just below user/kernel space
+    case 9:
         return (PTOKEN_PRIVILEGES)0x7FFFFFFFFFFFFFFF;
 
-    default: // Standard valid structure
+    default:
+        if (maxPrivileges < 1)
+            return NULL;
+
         pPrivileges->PrivilegeCount = 1;
-        pPrivileges->Privileges[0].Luid.LowPart = (__rdtsc() % 35) + 1; // Random valid privilege
+        pPrivileges->Privileges[0].Luid.LowPart = (ULONG)((FuzzRandom() % 35) + 1);
         pPrivileges->Privileges[0].Luid.HighPart = 0;
         pPrivileges->Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
         break;
@@ -1157,48 +1907,54 @@ PTOKEN_PRIVILEGES CreateFuzzedTokenPrivileges(
 *
 */
 PIO_STATUS_BLOCK CreateFuzzedIoStatusBlock(
-    _In_ BYTE* FuzzStructBuffer
+    _In_ BYTE* FuzzStructBuffer,
+    _In_ SIZE_T BufferSize
 )
 {
+    ULONG variation;
     PIO_STATUS_BLOCK IoStatusBlock;
-    ULONG variation = __rdtsc() % 8;
 
-    IoStatusBlock = (PIO_STATUS_BLOCK)FuzzStructBuffer;
-
-    switch (variation) {
-    case 0: // NULL status block
+    if (FuzzStructBuffer == NULL || BufferSize < sizeof(IO_STATUS_BLOCK))
         return NULL;
 
-    case 1: // Valid but zeroed
-        // Already zeroed above
+    IoStatusBlock = (PIO_STATUS_BLOCK)FuzzStructBuffer;
+    RtlSecureZeroMemory(IoStatusBlock, sizeof(IO_STATUS_BLOCK));
+
+    variation = (ULONG)(FuzzRandom() % 8);
+
+    switch (variation) {
+    case 0:
+        return NULL;
+
+    case 1:
         break;
 
-    case 2: // Valid with successful status
+    case 2:
         IoStatusBlock->Status = STATUS_SUCCESS;
         IoStatusBlock->Information = 0;
         break;
 
-    case 3: // Status pending
+    case 3:
         IoStatusBlock->Status = STATUS_PENDING;
         IoStatusBlock->Information = 0;
         break;
 
-    case 4: // Error status
+    case 4:
         IoStatusBlock->Status = STATUS_ACCESS_DENIED;
         IoStatusBlock->Information = 0;
         break;
 
-    case 5: // Information contains byte count
+    case 5:
         IoStatusBlock->Status = STATUS_SUCCESS;
-        IoStatusBlock->Information = 1024; // Simulated bytes transferred
+        IoStatusBlock->Information = 1024;
         break;
 
-    case 6: // Invalid pointer
-        return (PIO_STATUS_BLOCK)FuzzAddrData[__rdtsc() % FUZZADDR_COUNT];
+    case 6:
+        return (PIO_STATUS_BLOCK)FuzzAddrData[FuzzRandom() % FUZZADDR_COUNT];
 
-    case 7: // Random values
-        IoStatusBlock->Status = (NTSTATUS)FuzzStatusData[__rdtsc() % FUZZSTATUS_COUNT];
-        IoStatusBlock->Information = FuzzData[__rdtsc() % FUZZDATA_COUNT];
+    case 7:
+        IoStatusBlock->Status = (NTSTATUS)FuzzStatusData[FuzzRandom() % FUZZSTATUS_COUNT];
+        IoStatusBlock->Information = FuzzData[FuzzRandom() % FUZZDATA_COUNT];
         break;
     }
 
@@ -1214,40 +1970,46 @@ PIO_STATUS_BLOCK CreateFuzzedIoStatusBlock(
 *
 */
 PCLIENT_ID CreateFuzzedClientId(
-    _In_ BYTE* FuzzStructBuffer
+    _In_ BYTE* FuzzStructBuffer,
+    _In_ SIZE_T BufferSize
 )
 {
+    ULONG variation;
     PCLIENT_ID ClientId;
-    ULONG variation = __rdtsc() % 6;
 
-    ClientId = (PCLIENT_ID)FuzzStructBuffer;
-
-    switch (variation) {
-    case 0: // NULL client ID
+    if (FuzzStructBuffer == NULL || BufferSize < sizeof(CLIENT_ID))
         return NULL;
 
-    case 1: // Current process/thread
+    variation = (ULONG)(FuzzRandom() % 6);
+    ClientId = (PCLIENT_ID)FuzzStructBuffer;
+    RtlSecureZeroMemory(ClientId, sizeof(CLIENT_ID));
+
+    switch (variation) {
+    case 0:
+        return NULL;
+
+    case 1:
         ClientId->UniqueProcess = UlongToHandle(GetCurrentProcessId());
         ClientId->UniqueThread = UlongToHandle(GetCurrentThreadId());
         break;
 
-    case 2: // System process
-        ClientId->UniqueProcess = UlongToHandle(4); // System process ID
-        ClientId->UniqueThread = (HANDLE)FuzzHandleData[__rdtsc() % FUZZHANDLE_COUNT];
+    case 2:
+        ClientId->UniqueProcess = UlongToHandle(4);
+        ClientId->UniqueThread = (HANDLE)FuzzHandleData[FuzzRandom() % FUZZHANDLE_COUNT];
         break;
 
-    case 3: // Invalid process/valid thread
+    case 3:
         ClientId->UniqueProcess = UlongToHandle(0xFFFF);
         ClientId->UniqueThread = UlongToHandle(GetCurrentThreadId());
         break;
-        
-    case 4: // Valid process/invalid thread
+
+    case 4:
         ClientId->UniqueProcess = UlongToHandle(GetCurrentProcessId());
         ClientId->UniqueThread = UlongToHandle(0xFFFFFFFF);
         break;
 
-    case 5: // Invalid pointer
-        return (PCLIENT_ID)FuzzAddrData[__rdtsc() % FUZZADDR_COUNT];
+    case 5:
+        return (PCLIENT_ID)FuzzAddrData[FuzzRandom() % FUZZADDR_COUNT];
     }
 
     return ClientId;
@@ -1262,50 +2024,56 @@ PCLIENT_ID CreateFuzzedClientId(
 *
 */
 PLARGE_INTEGER CreateFuzzedLargeInteger(
-    _In_ BYTE* FuzzStructBuffer
+    _In_ BYTE* FuzzStructBuffer,
+    _In_ SIZE_T BufferSize
 )
 {
+    ULONG variation;
     PLARGE_INTEGER LargeInteger;
-    ULONG variation = __rdtsc() % 7;
 
-    LargeInteger = (PLARGE_INTEGER)FuzzStructBuffer;
-
-    switch (variation) {
-    case 0: // NULL large integer
+    if (FuzzStructBuffer == NULL || BufferSize < sizeof(LARGE_INTEGER))
         return NULL;
 
-    case 1: // Zero
+    variation = (ULONG)(FuzzRandom() % 7);
+    LargeInteger = (PLARGE_INTEGER)FuzzStructBuffer;
+    RtlSecureZeroMemory(LargeInteger, sizeof(LARGE_INTEGER));
+
+    switch (variation) {
+    case 0:
+        return NULL;
+
+    case 1:
         LargeInteger->QuadPart = 0;
         break;
 
-    case 2: // Small positive value
-        LargeInteger->QuadPart = __rdtsc() % 1000;
+    case 2:
+        LargeInteger->QuadPart = FuzzRandom() % 1000;
         break;
 
-    case 3: // Large positive value
+    case 3:
         LargeInteger->QuadPart = 0x7FFFFFFFFFFFFFFF;
         break;
 
-    case 4: // Negative value
+    case 4:
         LargeInteger->QuadPart = -10000;
         break;
 
-    case 5: // Invalid pointer
-        return (PLARGE_INTEGER)FuzzAddrData[__rdtsc() % FUZZADDR_COUNT];
+    case 5:
+        return (PLARGE_INTEGER)FuzzAddrData[FuzzRandom() % FUZZADDR_COUNT];
 
-    case 6: // Special time values
+    case 6:
     {
-        // Array of special time values in 100ns units
         static const LONGLONG specialTimes[] = {
-            0,                      // Zero time
-            10000000,               // 1 second
-            36000000000,            // 1 hour
-            864000000000,           // 1 day
-            -10000000,              // -1 second (relative time)
-            0x7FFFFFFFFFFFFFFF,     // Max positive value
-            0x8000000000000000      // Min negative value
+            0,
+            10000000,
+            36000000000,
+            864000000000,
+            -10000000,
+            0x7FFFFFFFFFFFFFFF,
+            0x8000000000000000
         };
-        LargeInteger->QuadPart = specialTimes[__rdtsc() % 7];
+
+        LargeInteger->QuadPart = specialTimes[FuzzRandom() % RTL_NUMBER_OF(specialTimes)];
     }
     break;
     }
@@ -1322,45 +2090,46 @@ PLARGE_INTEGER CreateFuzzedLargeInteger(
 *
 */
 PKERNEL_USER_TIMES CreateFuzzedProcessTimes(
-    _In_ BYTE* FuzzStructBuffer
+    _In_ BYTE* FuzzStructBuffer,
+    _In_ SIZE_T BufferSize
 )
 {
+    ULONG variation;
     PKERNEL_USER_TIMES Times;
-    ULONG variation = __rdtsc() % 5;
+    LARGE_INTEGER currentTime;
+
+    if (FuzzStructBuffer == NULL || BufferSize < sizeof(KERNEL_USER_TIMES))
+        return NULL;
 
     Times = (PKERNEL_USER_TIMES)FuzzStructBuffer;
     RtlZeroMemory(Times, sizeof(KERNEL_USER_TIMES));
+    variation = (ULONG)(FuzzRandom() % 5);
 
     switch (variation) {
-    case 0: // NULL
+    case 0:
         return NULL;
 
-    case 1: // Invalid pointer
-        return (PKERNEL_USER_TIMES)FuzzAddrData[__rdtsc() % FUZZADDR_COUNT];
+    case 1:
+        return (PKERNEL_USER_TIMES)FuzzAddrData[FuzzRandom() % FUZZADDR_COUNT];
 
-    case 2: // All zeros
-        // Already zeroed
+    case 2:
         break;
 
-    case 3: // Invalid values (very large)
+    case 3:
         Times->CreateTime.QuadPart = 0x7FFFFFFFFFFFFFFF;
         Times->ExitTime.QuadPart = 0x7FFFFFFFFFFFFFFF;
         Times->KernelTime.QuadPart = 0x7FFFFFFFFFFFFFFF;
         Times->UserTime.QuadPart = 0x7FFFFFFFFFFFFFFF;
         break;
 
-    case 4: // Realistic values
-    {
-        LARGE_INTEGER currentTime;
-        QueryPerformanceCounter(&currentTime);
+    case 4:
+        NtQuerySystemTime(&currentTime);
 
-        // Set a creation time in the past
-        Times->CreateTime.QuadPart = currentTime.QuadPart - 10000000000; // 1000s ago
-        Times->ExitTime.QuadPart = 0; // Not exited
-        Times->KernelTime.QuadPart = 2500000; // 0.25s kernel time
-        Times->UserTime.QuadPart = 5000000;   // 0.5s user time
-    }
-    break;
+        Times->CreateTime.QuadPart = currentTime.QuadPart - 10000000000i64;
+        Times->ExitTime.QuadPart = 0;
+        Times->KernelTime.QuadPart = 2500000;
+        Times->UserTime.QuadPart = 5000000;
+        break;
     }
 
     return Times;
@@ -1375,25 +2144,29 @@ PKERNEL_USER_TIMES CreateFuzzedProcessTimes(
 *
 */
 PSECTION_IMAGE_INFORMATION CreateFuzzedSectionImageInfo(
-    _In_ BYTE* FuzzStructBuffer
+    _In_ BYTE* FuzzStructBuffer,
+    _In_ SIZE_T BufferSize
 )
 {
+    ULONG variation;
     PSECTION_IMAGE_INFORMATION SectionInfo;
-    ULONG variation = __rdtsc() % 4;
 
+    if (FuzzStructBuffer == NULL || BufferSize < sizeof(SECTION_IMAGE_INFORMATION))
+        return NULL;
+
+    variation = (ULONG)(FuzzRandom() % 4);
     SectionInfo = (PSECTION_IMAGE_INFORMATION)FuzzStructBuffer;
     RtlZeroMemory(SectionInfo, sizeof(SECTION_IMAGE_INFORMATION));
 
     switch (variation) {
-    case 0: // NULL
+    case 0:
         return NULL;
 
-    case 1: // All zeros
-        // Already zeroed
+    case 1:
         break;
 
-    case 2: // Realistic PE values
-        SectionInfo->TransferAddress = (PVOID)0x400000;
+    case 2:
+        SectionInfo->TransferAddress = (PVOID)0x400000; //-V566
         SectionInfo->ZeroBits = 0;
         SectionInfo->MaximumStackSize = 0x100000;
         SectionInfo->CommittedStackSize = 0x10000;
@@ -1409,7 +2182,7 @@ PSECTION_IMAGE_INFORMATION CreateFuzzedSectionImageInfo(
         SectionInfo->CheckSum = 0x12345;
         break;
 
-    case 3: // Invalid values
+    case 3:
         SectionInfo->TransferAddress = (PVOID)0xFFFFFFFFFFFFFFFF;
         SectionInfo->ZeroBits = 0xFF;
         SectionInfo->MaximumStackSize = 0xFFFFFFFF;
@@ -1438,164 +2211,163 @@ PSECTION_IMAGE_INFORMATION CreateFuzzedSectionImageInfo(
 * Create a fuzzed registry value structure
 *
 */
-PVOID CreateFuzzedKeyValueParameter(VOID)
+PVOID CreateFuzzedKeyValueParameter(
+    VOID
+)
 {
-    BYTE* buf = (BYTE*)VirtualAlloc(NULL, MAX_KEYVALUE_BUFFER_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    BYTE* buf;
+    ULONG variation, keyType;
+
+    variation = (ULONG)FuzzRandom();
+    keyType = variation % 10;
+
+    if (keyType == 9) {
+        return (PVOID)FuzzAddrData[FuzzRandom() % FUZZADDR_COUNT];
+    }
+
+    buf = (BYTE*)VirtualAlloc(NULL, MAX_KEYVALUE_BUFFER_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!buf)
         return NULL;
 
-    FuzzTrackAllocation(buf, AllocTypeVirtualAlloc);
+    if (!FuzzTrackAllocation(buf, AllocTypeVirtualAlloc)) {
+        VirtualFree(buf, 0, MEM_RELEASE);
+        return NULL;
+    }
 
     RtlZeroMemory(buf, MAX_KEYVALUE_BUFFER_SIZE);
 
-    ULONG variation = (ULONG)__rdtsc();
-    ULONG keyType = variation % 10;
-
     switch (keyType) {
     case 0: {
-        //
-        // KEY_VALUE_BASIC_INFORMATION - normal, buffer-safe
-        //
-        PKEY_VALUE_BASIC_INFORMATION info = (PKEY_VALUE_BASIC_INFORMATION)buf;
-        ULONG maxNameLen = (MAX_KEYVALUE_BUFFER_SIZE - sizeof(*info) + sizeof(WCHAR)) / sizeof(WCHAR);
-        ULONG nameLen = (variation >> 4) % (maxNameLen + 1);
+        PKEY_VALUE_BASIC_INFORMATION info;
+        ULONG maxNameLen;
+        ULONG nameLen;
+        ULONG i;
+
+        info = (PKEY_VALUE_BASIC_INFORMATION)buf;
+        maxNameLen = (MAX_KEYVALUE_BUFFER_SIZE - sizeof(*info) + sizeof(WCHAR)) / sizeof(WCHAR);
+        nameLen = (variation >> 4) % (maxNameLen + 1);
         info->TitleIndex = (variation >> 8) & 0xFF;
         info->Type = (variation >> 16) & 0xF;
         info->NameLength = nameLen * sizeof(WCHAR);
-        if (sizeof(*info) - sizeof(WCHAR) + info->NameLength > MAX_KEYVALUE_BUFFER_SIZE)
-            info->NameLength = (MAX_KEYVALUE_BUFFER_SIZE - (sizeof(*info) - sizeof(WCHAR))) & ~1UL;
-        for (ULONG i = 0; i < info->NameLength / sizeof(WCHAR); ++i)
+        for (i = 0; i < info->NameLength / sizeof(WCHAR); ++i)
             info->Name[i] = (WCHAR)(L'A' + (variation + i) % 26);
         break;
     }
     case 1: {
-        //
-        // KEY_VALUE_FULL_INFORMATION - normal, buffer-safe
-        //
-        PKEY_VALUE_FULL_INFORMATION info = (PKEY_VALUE_FULL_INFORMATION)buf;
-        ULONG maxNameLen = (MAX_KEYVALUE_BUFFER_SIZE - sizeof(*info) + sizeof(WCHAR)) / sizeof(WCHAR);
-        ULONG nameLen = (variation >> 5) % (maxNameLen + 1);
-        info->NameLength = nameLen * sizeof(WCHAR);
-        if (sizeof(*info) - sizeof(WCHAR) + info->NameLength > MAX_KEYVALUE_BUFFER_SIZE)
-            info->NameLength = (MAX_KEYVALUE_BUFFER_SIZE - (sizeof(*info) - sizeof(WCHAR))) & ~1UL;
+        PKEY_VALUE_FULL_INFORMATION info;
+        ULONG maxNameLen;
+        ULONG nameLen;
+        ULONG dataOffset;
+        ULONG maxDataLen;
+        ULONG dataLen;
+        BYTE* data;
+        ULONG i;
 
-        ULONG dataOffset = sizeof(*info) - sizeof(WCHAR) + info->NameLength;
-        ULONG maxDataLen = (dataOffset < MAX_KEYVALUE_BUFFER_SIZE)
-            ? (MAX_KEYVALUE_BUFFER_SIZE - dataOffset)
-            : 0;
-        ULONG dataLen = (variation >> 9) % (maxDataLen + 1);
+        info = (PKEY_VALUE_FULL_INFORMATION)buf;
+        maxNameLen = (MAX_KEYVALUE_BUFFER_SIZE - sizeof(*info) + sizeof(WCHAR)) / sizeof(WCHAR);
+        nameLen = (variation >> 5) % (maxNameLen + 1);
+        info->NameLength = nameLen * sizeof(WCHAR);
+        dataOffset = sizeof(*info) - sizeof(WCHAR) + info->NameLength;
+        maxDataLen = (dataOffset < MAX_KEYVALUE_BUFFER_SIZE) ?
+            (MAX_KEYVALUE_BUFFER_SIZE - dataOffset) : 0;
+        dataLen = (variation >> 9) % (maxDataLen + 1);
 
         info->TitleIndex = (variation >> 12) & 0xFF;
         info->Type = (variation >> 20) & 0xF;
         info->DataLength = dataLen;
         info->DataOffset = dataOffset;
 
-        for (ULONG i = 0; i < info->NameLength / sizeof(WCHAR); ++i)
+        for (i = 0; i < info->NameLength / sizeof(WCHAR); ++i)
             info->Name[i] = (WCHAR)(L'B' + (variation + i) % 26);
 
-        BYTE* data = buf + info->DataOffset;
-        for (ULONG i = 0; i < dataLen && (info->DataOffset + i) < MAX_KEYVALUE_BUFFER_SIZE; ++i)
+        data = buf + info->DataOffset;
+        for (i = 0; i < dataLen && (info->DataOffset + i) < MAX_KEYVALUE_BUFFER_SIZE; ++i)
             data[i] = (BYTE)((variation >> (i % 16)) & 0xFF);
         break;
     }
     case 2: {
-        //
-        // KEY_VALUE_PARTIAL_INFORMATION - normal, buffer-safe
-        //
-        PKEY_VALUE_PARTIAL_INFORMATION info = (PKEY_VALUE_PARTIAL_INFORMATION)buf;
-        ULONG maxDataLen = (MAX_KEYVALUE_BUFFER_SIZE > sizeof(*info))
-            ? (MAX_KEYVALUE_BUFFER_SIZE - sizeof(*info) + 1)
-            : 0;
-        ULONG dataLen = (variation >> 4) % (maxDataLen + 1);
-        if (sizeof(*info) - 1 + dataLen > MAX_KEYVALUE_BUFFER_SIZE)
-            dataLen = MAX_KEYVALUE_BUFFER_SIZE - (sizeof(*info) - 1);
+        PKEY_VALUE_PARTIAL_INFORMATION info;
+        ULONG maxDataLen;
+        ULONG dataLen;
+        ULONG i;
+
+        info = (PKEY_VALUE_PARTIAL_INFORMATION)buf;
+        maxDataLen = (MAX_KEYVALUE_BUFFER_SIZE > sizeof(*info)) ?
+            (MAX_KEYVALUE_BUFFER_SIZE - sizeof(*info) + 1) : 0;
+        dataLen = (variation >> 4) % (maxDataLen + 1);
         info->TitleIndex = (variation >> 1) & 0xFF;
         info->Type = (variation >> 10) & 0xF;
         info->DataLength = dataLen;
-        for (ULONG i = 0; i < dataLen; ++i)
+        for (i = 0; i < dataLen; ++i)
             info->Data[i] = (UCHAR)((variation + i) & 0xFF);
         break;
     }
     case 3: {
-        //
-        // KEY_VALUE_PARTIAL_INFORMATION_ALIGN64 - normal, buffer-safe
-        //
-        PKEY_VALUE_PARTIAL_INFORMATION_ALIGN64 info = (PKEY_VALUE_PARTIAL_INFORMATION_ALIGN64)buf;
-        ULONG maxDataLen = (MAX_KEYVALUE_BUFFER_SIZE > sizeof(*info))
-            ? (MAX_KEYVALUE_BUFFER_SIZE - sizeof(*info) + 1)
-            : 0;
-        ULONG dataLen = (variation >> 2) % (maxDataLen + 1);
-        if (sizeof(*info) - 1 + dataLen > MAX_KEYVALUE_BUFFER_SIZE)
-            dataLen = MAX_KEYVALUE_BUFFER_SIZE - (sizeof(*info) - 1);
+        PKEY_VALUE_PARTIAL_INFORMATION_ALIGN64 info;
+        ULONG maxDataLen;
+        ULONG dataLen;
+        ULONG i;
+
+        info = (PKEY_VALUE_PARTIAL_INFORMATION_ALIGN64)buf;
+        maxDataLen = (MAX_KEYVALUE_BUFFER_SIZE > sizeof(*info)) ?
+            (MAX_KEYVALUE_BUFFER_SIZE - sizeof(*info) + 1) : 0;
+        dataLen = (variation >> 2) % (maxDataLen + 1);
         info->Type = (variation >> 6) & 0xF;
         info->DataLength = dataLen;
-        for (ULONG i = 0; i < dataLen; ++i)
+        for (i = 0; i < dataLen; ++i)
             info->Data[i] = (UCHAR)(((variation >> (i % 8)) ^ 0xAA) & 0xFF);
         break;
     }
     case 4: {
-        //
-        // KEY_VALUE_FULL_INFORMATION - edge/invalid metadata values
-        //
-        PKEY_VALUE_FULL_INFORMATION info = (PKEY_VALUE_FULL_INFORMATION)buf;
+        PKEY_VALUE_FULL_INFORMATION info;
+
+        info = (PKEY_VALUE_FULL_INFORMATION)buf;
         info->TitleIndex = 0xFFFFFFFF;
         info->Type = 0xDEADBEEF;
         info->NameLength = 0x10000;
         info->DataLength = 0x10000;
         info->DataOffset = 0xFFFFFFF0;
-        // Name/Data purposely uninitialized for edge testing
         break;
     }
     case 5: {
-        //
-        // KEY_VALUE_BASIC_INFORMATION - edge/invalid metadata values (NameLength, etc.)
-        //
-        PKEY_VALUE_BASIC_INFORMATION info = (PKEY_VALUE_BASIC_INFORMATION)buf;
+        PKEY_VALUE_BASIC_INFORMATION info;
+
+        info = (PKEY_VALUE_BASIC_INFORMATION)buf;
         info->TitleIndex = 0xFFFFFFFF;
         info->Type = 0x1BADB002;
         info->NameLength = 0xFFFFFFFC;
-        // Name purposely uninitialized for edge testing
         break;
     }
     case 6: {
-        //
-        // KEY_VALUE_PARTIAL_INFORMATION - edge/invalid DataLength
-        //
-        PKEY_VALUE_PARTIAL_INFORMATION info = (PKEY_VALUE_PARTIAL_INFORMATION)buf;
+        PKEY_VALUE_PARTIAL_INFORMATION info;
+
+        info = (PKEY_VALUE_PARTIAL_INFORMATION)buf;
         info->TitleIndex = 0xFFFFFFFF;
         info->Type = 0xABCD1234;
         info->DataLength = 0xFFFFFFFF;
-        // Data purposely uninitialized
         break;
     }
     case 7: {
-        //
-        // KEY_VALUE_PARTIAL_INFORMATION_ALIGN64 - edge/invalid DataLength
-        //
-        PKEY_VALUE_PARTIAL_INFORMATION_ALIGN64 info = (PKEY_VALUE_PARTIAL_INFORMATION_ALIGN64)buf;
+        PKEY_VALUE_PARTIAL_INFORMATION_ALIGN64 info;
+
+        info = (PKEY_VALUE_PARTIAL_INFORMATION_ALIGN64)buf;
         info->Type = 0xF00DFACE;
         info->DataLength = 0xFFFFFFFF;
-        // Data purposely uninitialized
         break;
     }
     case 8: {
-        //
-        // KEY_VALUE_FULL_INFORMATION - conflicting/overlapping metadata
-        //
-        PKEY_VALUE_FULL_INFORMATION info = (PKEY_VALUE_FULL_INFORMATION)buf;
+        PKEY_VALUE_FULL_INFORMATION info;
+
+        info = (PKEY_VALUE_FULL_INFORMATION)buf;
         info->TitleIndex = 0x0;
         info->Type = 0x0;
         info->NameLength = 0x80000000;
         info->DataLength = 0x80000000;
         info->DataOffset = 0x10;
-        // Name/Data purposely uninitialized
         break;
     }
     default:
-        //
-        // Return random fuzz data
-        //
-        return (PVOID)FuzzAddrData[__rdtsc() % FUZZADDR_COUNT];
+        break;
     }
 
     return buf;
